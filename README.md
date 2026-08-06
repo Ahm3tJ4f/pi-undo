@@ -1,5 +1,9 @@
 # pi-undo
 
+[![npm version](https://img.shields.io/npm/v/@ahm3tj4f/pi-undo)](https://www.npmjs.com/package/@ahm3tj4f/pi-undo)
+[![npm downloads](https://img.shields.io/npm/dm/@ahm3tj4f/pi-undo)](https://www.npmjs.com/package/@ahm3tj4f/pi-undo)
+[![license](https://img.shields.io/npm/l/@ahm3tj4f/pi-undo)](https://github.com/ahm3tj4f/pi-undo/blob/main/LICENSE)
+
 Undo/redo for pi. But this time it works.
 
 This is a port of OpenCode's exact undo/redo philosophy: snapshot the files
@@ -38,4 +42,8 @@ restart.
 
 ```bash
 pi install npm:@ahm3tj4f/pi-undo
+
+# OR
+
+pi install git:github.com/ahm3tj4f/pi-undo
 ```
