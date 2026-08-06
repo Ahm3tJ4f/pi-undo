@@ -1,0 +1,521 @@
+import { createHash } from "node:crypto"
+import { existsSync } from "node:fs"
+import { copyFile, lstat, mkdir, readFile, rm, stat as fsStat, writeFile } from "node:fs/promises"
+import { homedir, tmpdir } from "node:os"
+import path from "node:path"
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
+import type { NumstatRow } from "./util.ts"
+import { literalPathspec, normalizeGitPath, nulSplit, unique } from "./util.ts"
+
+const MAX_UNTRACKED_SIZE = 2 * 1024 * 1024
+
+const PRUNE = "7.days"
+
+const BATCH = 100
+const GIT_TIMEOUT = 120_000
+const GC_INTERVAL_MS = 24 * 60 * 60 * 1000
+
+const PI_EXCLUDE: string[] = [":(exclude).pi", ":(exclude,glob)**/.pi/**"]
+
+interface GitResult {
+  stdout: string
+  stderr: string
+  code: number
+}
+
+interface GitOptions {
+  allowFailure?: boolean
+}
+
+interface StoreMeta {
+  cwd: string
+  updatedAt: number
+  lastGcAt?: number
+  
+  largeExcludes?: string[]
+}
+
+export function snapshotStoreRoot(): string {
+  return process.env.PI_UNDO_STORE_ROOT ?? path.join(homedir(), ".pi", "agent", "pi-undo", "snapshots")
+}
+
+export interface RestoreResult {
+  
+  skipped: string[]
+}
+
+export interface DiffStatResult {
+  rows: NumstatRow[]
+  
+  binaryCount: number
+}
+
+export interface SnapshotRepo {
+  ensure(): Promise<void>
+  track(): Promise<string>
+  changedFiles(from: string, to: string): Promise<string[]>
+  dirtySince(snapshot: string): Promise<string[]>
+  restoreSnapshot(snapshot: string, files: string[]): Promise<RestoreResult>
+  verifySnapshot(snapshot: string, exclude?: string[]): Promise<boolean>
+  diffNumstat(from: string, to: string): Promise<DiffStatResult>
+  gcIfDue(): Promise<void>
+}
+
+export class ShadowGit implements SnapshotRepo {
+  readonly cwd: string
+  private readonly pi: ExtensionAPI
+  private readonly gitdir: string
+  private initialized = false
+
+  constructor(pi: ExtensionAPI, cwd: string) {
+    this.pi = pi
+    this.cwd = cwd
+    const key = createHash("sha256").update(cwd).digest("hex").slice(0, 24)
+    this.gitdir = path.join(snapshotStoreRoot(), key)
+  }
+
+  
+  async ensure(): Promise<void> {
+    if (this.initialized) return
+    await mkdir(this.gitdir, { recursive: true })
+    const existed = existsSync(path.join(this.gitdir, "HEAD"))
+    if (!existed) {
+      const init = await this.git(["init", "--quiet"], { allowFailure: true })
+      if (init.code !== 0) {
+        throw new Error(`git init failed: ${init.stderr.trim() || `exit ${init.code}`}`)
+      }
+      const configs: string[][] = [
+        ["config", "core.autocrlf", "false"],
+        ["config", "core.longpaths", "true"],
+        ["config", "core.symlinks", "true"],
+        ["config", "core.fsmonitor", "false"],
+        
+        ["config", "feature.manyFiles", "true"],
+        ["config", "index.version", "4"],
+        ["config", "index.threads", "true"],
+        ["config", "core.untrackedCache", "true"],
+      ]
+      for (const args of configs) {
+        await this.git(args, { allowFailure: true })
+      }
+      await this.seed()
+    }
+    await this.writeMeta({ updatedAt: Date.now() })
+    this.initialized = true
+  }
+
+  
+  async track(): Promise<string> {
+    await this.ensure()
+    await this.add()
+    const result = await this.git(["write-tree"])
+    return result.stdout.trim()
+  }
+
+  
+  async changedFiles(from: string, to: string): Promise<string[]> {
+    await this.ensure()
+    const result = await this.git(
+      ["diff", "--name-only", "-z", "--no-renames", from, to, "--", ".", ...PI_EXCLUDE],
+      { allowFailure: true },
+    )
+    if (result.code !== 0) return []
+    return unique(nulSplit(result.stdout).map(normalizeGitPath).filter((f): f is string => Boolean(f)))
+  }
+
+  
+  async dirtySince(snapshot: string): Promise<string[]> {
+    await this.ensure()
+    
+    
+    const meta = await this.readMeta()
+    await this.syncExcludes(meta.largeExcludes ?? [])
+    const [worktree, staged, untracked] = await Promise.all([
+      this.git(["diff-files", "--name-only", "-z", "--", ".", ...PI_EXCLUDE], { allowFailure: true }),
+      this.git(["diff", "--cached", "--name-only", "-z", snapshot, "--", ".", ...PI_EXCLUDE], {
+        allowFailure: true,
+      }),
+      this.git(["ls-files", "--full-name", "--others", "--exclude-standard", "-z", "--", ".", ...PI_EXCLUDE], {
+        allowFailure: true,
+      }),
+    ])
+    return unique(
+      [...nulSplit(worktree.stdout), ...nulSplit(staged.stdout), ...nulSplit(untracked.stdout)]
+        .map(normalizeGitPath)
+        .filter((f): f is string => Boolean(f)),
+    )
+  }
+
+  
+  async restoreSnapshot(snapshot: string, files: string[]): Promise<RestoreResult> {
+    await this.ensure()
+    const rels = unique(files.map(normalizeGitPath).filter((f): f is string => Boolean(f)))
+    if (rels.length === 0) return { skipped: [] }
+
+    const blocked: string[] = []
+    const safe: string[] = []
+    for (const rel of rels) {
+      if (await this.hasSymlinkParent(rel)) blocked.push(rel)
+      else safe.push(rel)
+    }
+    if (blocked.length > 0) {
+      
+      
+      
+      await this.dropPaths(blocked)
+    }
+    if (safe.length === 0) return { skipped: blocked }
+
+    const inTree = await this.listTree(snapshot, safe)
+    const missing = safe.filter((rel) => !inTree.has(rel))
+    const present = safe.filter((rel) => inTree.has(rel))
+
+    
+    
+    const deleted: string[] = []
+    for (const rel of [...missing].sort((a, b) => b.length - a.length)) {
+      try {
+        await rm(path.join(this.cwd, rel), { recursive: true, force: true })
+        deleted.push(rel)
+      } catch {
+        
+      }
+    }
+    if (deleted.length > 0) await this.stagePaths(deleted)
+
+    
+    await this.checkoutPaths(snapshot, [...present].sort((a, b) => a.length - b.length))
+    return { skipped: blocked }
+  }
+
+  
+  private async hasSymlinkParent(rel: string): Promise<boolean> {
+    let current = this.cwd
+    const parts = rel.split("/")
+    for (let i = 0; i < parts.length - 1; i++) {
+      const part = parts[i]
+      if (!part) continue
+      current = path.join(current, part)
+      try {
+        if ((await lstat(current)).isSymbolicLink()) return true
+      } catch {
+        
+        return false
+      }
+    }
+    return false
+  }
+
+  
+  async verifySnapshot(snapshot: string, exclude: string[] = []): Promise<boolean> {
+    await this.ensure()
+    if (exclude.length === 0) {
+      const result = await this.git(["write-tree"], { allowFailure: true })
+      return result.code === 0 && result.stdout.trim() === snapshot
+    }
+    const result = await this.git(
+      ["diff", "--cached", "--name-only", "-z", snapshot, "--", ".", ...PI_EXCLUDE],
+      { allowFailure: true },
+    )
+    if (result.code !== 0) return false
+    const excluded = new Set(exclude)
+    return nulSplit(result.stdout)
+      .map(normalizeGitPath)
+      .filter((f): f is string => Boolean(f))
+      .every((file) => excluded.has(file))
+  }
+
+  
+  async diffNumstat(from: string, to: string): Promise<DiffStatResult> {
+    await this.ensure()
+    const result = await this.git(
+      ["diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", from, to, "--", ".", ...PI_EXCLUDE],
+      { allowFailure: true },
+    )
+    if (result.code !== 0) return { rows: [], binaryCount: 0 }
+    const rows: NumstatRow[] = []
+    let binaryCount = 0
+    
+    
+    for (const record of result.stdout.split("\0").filter(Boolean)) {
+      const fields = record.split("\t")
+      const added = fields[0]
+      const removed = fields[1]
+      const file = fields.slice(2).join("\t")
+      if (added === undefined || removed === undefined || !file) continue
+      if (added === "-" || removed === "-") {
+        binaryCount++
+        continue
+      }
+      const a = Number.parseInt(added, 10)
+      const r = Number.parseInt(removed, 10)
+      if (Number.isNaN(a) || Number.isNaN(r)) continue
+      rows.push({ file: normalizeGitPath(file) ?? file, added: a, removed: r })
+    }
+    return { rows, binaryCount }
+  }
+
+  
+  async gcIfDue(): Promise<void> {
+    await this.ensure()
+    const meta = await this.readMeta()
+    if (meta.lastGcAt !== undefined && Date.now() - meta.lastGcAt < GC_INTERVAL_MS) return
+    const result = await this.git(["gc", `--prune=${PRUNE}`], { allowFailure: true })
+    if (result.code !== 0) return
+    await this.writeMeta({ lastGcAt: Date.now() })
+  }
+
+  
+  
+  
+
+  private async git(args: string[], opts: GitOptions = {}): Promise<GitResult> {
+    const result = await this.pi.exec(
+      "git",
+      ["--git-dir", this.gitdir, "--work-tree", this.cwd, ...args],
+      { cwd: this.cwd, timeout: GIT_TIMEOUT },
+    )
+    if (!opts.allowFailure && result.code !== 0) {
+      throw new Error(`git ${args[0] ?? ""} failed: ${result.stderr.trim() || `exit ${result.code}`}`)
+    }
+    return { stdout: result.stdout, stderr: result.stderr, code: result.code }
+  }
+
+  
+  private async sourceGitDir(): Promise<string | null> {
+    const result = await this.pi.exec("git", ["rev-parse", "--absolute-git-dir"], { cwd: this.cwd })
+    if (result.code !== 0) return null
+    const dir = result.stdout.trim()
+    if (!dir || dir === this.gitdir) return null
+    return dir
+  }
+
+  
+  private async seed(): Promise<void> {
+    const source = await this.sourceGitDir()
+    if (!source) return
+
+    const sourceObjects = path.join(source, "objects")
+    if (!existsSync(sourceObjects)) return
+    const alternates = [sourceObjects]
+    try {
+      
+      const chained = await readFile(path.join(sourceObjects, "info", "alternates"), "utf8")
+      for (const line of chained.split("\n")) {
+        const candidate = line.trim()
+        if (candidate && existsSync(candidate) && !alternates.includes(candidate)) {
+          alternates.push(candidate)
+        }
+      }
+    } catch {
+      
+    }
+    await mkdir(path.join(this.gitdir, "objects", "info"), { recursive: true })
+    await writeFile(path.join(this.gitdir, "objects", "info", "alternates"), alternates.join("\n") + "\n")
+
+    
+    if (await this.sourceHasSparseCheckout()) return
+    const sourceIndex = path.join(source, "index")
+    if (!existsSync(sourceIndex)) return
+    try {
+      await copyFile(sourceIndex, path.join(this.gitdir, "index"))
+      
+      const check = await this.git(["ls-files"], { allowFailure: true })
+      if (check.code !== 0) {
+        await rm(path.join(this.gitdir, "index"), { force: true })
+      }
+    } catch {
+      await rm(path.join(this.gitdir, "index"), { force: true })
+    }
+  }
+
+  private async sourceHasSparseCheckout(): Promise<boolean> {
+    for (const key of ["core.sparseCheckout", "index.sparse"]) {
+      const result = await this.pi.exec("git", ["config", "--get", key], { cwd: this.cwd })
+      if (result.code === 0 && result.stdout.trim() === "true") return true
+    }
+    return false
+  }
+
+  
+  private async add(): Promise<void> {
+    const meta = await this.readMeta()
+    await this.syncExcludes(meta.largeExcludes ?? [])
+    const [changed, untracked] = await Promise.all([
+      this.git(["diff-files", "--name-only", "-z", "--", ".", ...PI_EXCLUDE], { allowFailure: true }),
+      this.git(["ls-files", "--full-name", "--others", "--exclude-standard", "-z", "--", ".", ...PI_EXCLUDE], {
+        allowFailure: true,
+      }),
+    ])
+    const all = unique([...nulSplit(changed.stdout), ...nulSplit(untracked.stdout)])
+      .map(normalizeGitPath)
+      .filter((f): f is string => Boolean(f))
+    if (all.length === 0) return
+
+    const ignored = await this.checkIgnored(all)
+    if (ignored.size > 0) await this.dropPaths([...ignored])
+    const allow = all.filter((file) => !ignored.has(file))
+    if (allow.length === 0) return
+
+    
+    
+    const untrackedSet = new Set(
+      nulSplit(untracked.stdout).map(normalizeGitPath).filter((f): f is string => Boolean(f)),
+    )
+    const large = new Set<string>()
+    for (const file of allow) {
+      if (!untrackedSet.has(file)) continue
+      try {
+        const info = await fsStat(path.join(this.cwd, file))
+        if (info.isFile() && info.size > MAX_UNTRACKED_SIZE) large.add(file)
+      } catch {
+        
+      }
+    }
+    if (large.size > 0) {
+      
+      
+      const largeList = unique([...(meta.largeExcludes ?? []), ...large])
+      await this.writeMeta({ largeExcludes: largeList })
+      await this.syncExcludes(largeList)
+    }
+
+    await this.stagePaths(allow.filter((file) => !large.has(file)))
+  }
+
+  
+  private async checkIgnored(files: string[]): Promise<Set<string>> {
+    const ignored = new Set<string>()
+    for (let i = 0; i < files.length; i += BATCH) {
+      const chunk = files.slice(i, i + BATCH)
+      const result = await this.git(
+        [
+          "-c",
+          "core.quotepath=false",
+          "check-ignore",
+          "--no-index",
+          ...chunk.map((file) => (file.startsWith(":") ? `./${file}` : file)),
+        ],
+        { allowFailure: true },
+      )
+      
+      
+      
+      if (result.code === 0 || result.code === 1) {
+        for (const file of result.stdout.split("\n").filter(Boolean)) {
+          ignored.add(file.startsWith("./:") ? file.slice(2) : file)
+        }
+      }
+    }
+    return ignored
+  }
+
+  
+  private async stagePaths(files: string[]): Promise<void> {
+    await this.gitWithPathspec(["add", "--all", "--sparse"], files)
+  }
+
+  
+  private async dropPaths(files: string[]): Promise<void> {
+    await this.gitWithPathspec(["rm", "--cached", "-f", "--ignore-unmatch"], files)
+  }
+
+  
+  private async gitWithPathspec(command: string[], files: string[]): Promise<void> {
+    if (files.length === 0) return
+    const specFile = path.join(tmpdir(), `pi-undo-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.paths`)
+    await writeFile(specFile, files.map(literalPathspec).join("\0") + "\0")
+    try {
+      const result = await this.git(
+        [...command, `--pathspec-from-file=${specFile}`, "--pathspec-file-nul"],
+        { allowFailure: true },
+      )
+      if (result.code !== 0) {
+        throw new Error(`${command[0] ?? "git"} failed: ${result.stderr.trim() || `exit ${result.code}`}`)
+      }
+    } finally {
+      await rm(specFile, { force: true })
+    }
+  }
+
+  
+  private async listTree(tree: string, paths: string[]): Promise<Set<string>> {
+    const found = new Set<string>()
+    for (let i = 0; i < paths.length; i += BATCH) {
+      const chunk = paths.slice(i, i + BATCH)
+      const result = await this.git(
+        ["ls-tree", "--name-only", "-z", tree, "--", ...chunk.map(literalPathspec)],
+        { allowFailure: true },
+      )
+      if (result.code !== 0) continue
+      for (const name of nulSplit(result.stdout)) found.add(name)
+    }
+    return found
+  }
+
+  
+  private async checkoutPaths(tree: string, paths: string[]): Promise<void> {
+    for (const group of this.chunkNonClashing(paths)) {
+      const result = await this.git(
+        ["checkout", "-f", tree, "--", ...group.map(literalPathspec)],
+        { allowFailure: true },
+      )
+      if (result.code === 0) continue
+      for (const file of group) {
+        const single = await this.git(["checkout", "-f", tree, "--", literalPathspec(file)], {
+          allowFailure: true,
+        })
+        if (single.code !== 0) {
+          throw new Error(`failed to restore ${file}: ${single.stderr.trim() || `exit ${single.code}`}`)
+        }
+      }
+    }
+  }
+
+  
+  private chunkNonClashing(paths: string[]): string[][] {
+    const groups: string[][] = []
+    let current: string[] = []
+    for (const file of paths) {
+      if (current.some((other) => file.startsWith(`${other}/`) || other.startsWith(`${file}/`))) {
+        groups.push(current)
+        current = []
+      }
+      current.push(file)
+    }
+    if (current.length > 0) groups.push(current)
+    return groups
+  }
+
+  
+  private async syncExcludes(extra: string[]): Promise<void> {
+    const source = await this.sourceGitDir()
+    let text = ""
+    if (source) {
+      const excludePath = path.join(source, "info", "exclude")
+      if (existsSync(excludePath)) {
+        text = (await readFile(excludePath, "utf8")).trimEnd()
+      }
+    }
+    const lines = [...(text ? text.split("\n") : []), ...extra.map((file) => `/${file.replaceAll("\\", "/")}`)]
+    await mkdir(path.join(this.gitdir, "info"), { recursive: true })
+    await writeFile(path.join(this.gitdir, "info", "exclude"), lines.join("\n") + "\n")
+  }
+
+  private metaFile(): string {
+    return path.join(this.gitdir, "meta.json")
+  }
+
+  private async readMeta(): Promise<Partial<StoreMeta>> {
+    try {
+      return JSON.parse(await readFile(this.metaFile(), "utf8")) as Partial<StoreMeta>
+    } catch {
+      return {}
+    }
+  }
+
+  private async writeMeta(patch: Partial<StoreMeta>): Promise<void> {
+    const meta = { cwd: this.cwd, ...(await this.readMeta()), ...patch }
+    await writeFile(this.metaFile(), JSON.stringify(meta)).catch(() => {})
+  }
+}
