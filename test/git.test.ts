@@ -432,6 +432,10 @@ test("nested git repos are excluded: edits inside them are not undoable", async 
     const git = await newShadow(dir);
     const before = await tracked(git);
 
+    // Nested repos are never snapshotted, so they must not be reported as
+    // manual edits either.
+    assert.deepEqual(await git.dirtySince(before), []);
+
     
     await writeFile(path.join(dir, "root.txt"), "edited\n");
     await writeFile(path.join(dir, "nested", "g.txt"), "edited\n");
@@ -440,6 +444,7 @@ test("nested git repos are excluded: edits inside them are not undoable", async 
 
     
     assert.deepEqual(await git.changedFiles(before, after), ["root.txt"]);
+    assert.deepEqual(await git.dirtySince(after), []);
 
     
     await git.restoreSnapshot(before, ["root.txt"]);

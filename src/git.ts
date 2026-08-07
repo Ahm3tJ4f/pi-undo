@@ -196,11 +196,16 @@ export class ShadowGit implements SnapshotRepo {
         allowFailure: true,
       }),
     ])
-    return unique(
-      [...nulSplit(worktree.stdout), ...nulSplit(staged.stdout), ...nulSplit(untracked.stdout)]
-        .map(normalizeGitPath)
-        .filter((f): f is string => Boolean(f)),
-    )
+    const tracked = [...nulSplit(worktree.stdout), ...nulSplit(staged.stdout)]
+      .map(normalizeGitPath)
+      .filter((f): f is string => Boolean(f))
+    // Untracked nested git repos are reported as dir/ entries. They are never
+    // staged into snapshots, so they cannot be manual edits over a snapshot
+    // and must not block undo.
+    const untrackedFiles = nulSplit(untracked.stdout)
+      .map(normalizeGitPath)
+      .filter((f): f is string => f !== undefined && !f.endsWith("/"))
+    return unique([...tracked, ...untrackedFiles])
   }
 
   async restoreSnapshot(snapshot: string, files: string[]): Promise<RestoreResult> {
