@@ -562,6 +562,129 @@ test("file cap skips snapshots with a warning", async () => {
   }
 });
 
+test("binary files are tracked, shown as binary in stats, and restored", async () => {
+  const dir = await newTempDir("pi-undo-binary-");
+  try {
+    await writeFile(path.join(dir, "a.txt"), "one\n");
+    const git = await newShadow(dir);
+    const before = await tracked(git);
+
+    const bin = Buffer.from([0x00, 0x01, 0x02, 0xff, 0x00]);
+    await writeFile(path.join(dir, "blob.bin"), bin);
+    const after = await tracked(git);
+
+    assert.deepEqual(await git.changedFiles(before, after), ["blob.bin"]);
+    const stats = await git.diffNumstat(before, after);
+    assert.equal(stats.binaryCount, 1);
+    assert.deepEqual(stats.rows, []);
+
+    await git.restoreSnapshot(before, ["blob.bin"]);
+    await assert.rejects(readFile(path.join(dir, "blob.bin")));
+    assert.equal(await git.verifySnapshot(before), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("file created and deleted within one message leaves no trace", async () => {
+  const dir = await newTempDir("pi-undo-createdelete-");
+  try {
+    const git = await newShadow(dir);
+    const before = await tracked(git);
+
+    await writeFile(path.join(dir, "tmp.txt"), "x\n");
+    const mid = await tracked(git);
+    assert.deepEqual(await git.changedFiles(before, mid), ["tmp.txt"]);
+
+    await rm(path.join(dir, "tmp.txt"));
+    const after = await tracked(git);
+    assert.deepEqual(await git.changedFiles(before, after), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a file deleted by hand after the turn is recreated by restore", async () => {
+  const dir = await newTempDir("pi-undo-recreate-");
+  try {
+    const git = await newShadow(dir);
+    await tracked(git);
+
+    await writeFile(path.join(dir, "f.txt"), "content\n");
+    const after = await tracked(git);
+
+    await rm(path.join(dir, "f.txt"));
+    await git.restoreSnapshot(after, ["f.txt"]);
+    assert.equal(await readFile(path.join(dir, "f.txt"), "utf8"), "content\n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("chmod-only changes are detected and restored", async () => {
+  const dir = await newTempDir("pi-undo-chmod-");
+  try {
+    await writeFile(path.join(dir, "run.sh"), "#!/bin/sh\necho hi\n");
+    const git = await newShadow(dir);
+    const before = await tracked(git);
+
+    await exec("chmod", ["+x", path.join(dir, "run.sh")]);
+    const after = await tracked(git);
+    assert.deepEqual(await git.changedFiles(before, after), ["run.sh"]);
+
+    await git.restoreSnapshot(before, ["run.sh"]);
+    const st = await lstat(path.join(dir, "run.sh"));
+    assert.equal(st.mode & 0o111, 0, "executable bit is restored");
+    assert.equal(await git.verifySnapshot(before), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("fifos in the worktree do not break tracking", async () => {
+  const dir = await newTempDir("pi-undo-fifo-");
+  try {
+    await writeFile(path.join(dir, "a.txt"), "one\n");
+    if (process.platform !== "win32") {
+      await exec("mkfifo", [path.join(dir, "pipe.fifo")]);
+    }
+    const git = await newShadow(dir);
+    const before = await tracked(git);
+
+    await writeFile(path.join(dir, "b.txt"), "two\n");
+    const after = await tracked(git);
+    assert.deepEqual(await git.changedFiles(before, after), ["b.txt"]);
+    assert.deepEqual(await git.dirtySince(after), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("restore from a store for another directory fails without deleting files", async () => {
+  const dirA = await newTempDir("pi-undo-cross-a-");
+  const dirB = await newTempDir("pi-undo-cross-b-");
+  try {
+    await writeFile(path.join(dirA, "keep.txt"), "precious\n");
+    const gitA = await newShadow(dirA);
+    const before = await tracked(gitA);
+    await writeFile(path.join(dirA, "keep.txt"), "edited\n");
+    const after = await tracked(gitA);
+    assert.deepEqual(await gitA.changedFiles(before, after), ["keep.txt"]);
+
+    // A second session in another directory cannot see dirA's trees.
+    await writeFile(path.join(dirB, "keep.txt"), "precious\n");
+    const gitB = await newShadow(dirB);
+    await assert.rejects(
+      gitB.restoreSnapshot(before!, ["keep.txt"]),
+      /snapshot tree not found/,
+    );
+    assert.equal(await readFile(path.join(dirB, "keep.txt"), "utf8"), "precious\n");
+  } finally {
+    await rm(dirA, { recursive: true, force: true });
+    await rm(dirB, { recursive: true, force: true });
+  }
+});
+
 async function findShadowGitDir(cwd: string): Promise<string> {
   const storeRoot = snapshotStoreRoot();
   const { readdir } = await import("node:fs/promises");

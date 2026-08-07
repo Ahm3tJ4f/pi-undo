@@ -224,6 +224,15 @@ export class ShadowGit implements SnapshotRepo {
     }
     if (safe.length === 0) return { skipped: blocked }
 
+    // Never delete files based on a tree this store does not have (for
+    // example a session resumed in a different directory). ls-tree on a
+    // missing tree returns nothing, which would turn every file into
+    // "missing" and delete it.
+    const treeOk = await this.git(["cat-file", "-e", `${snapshot}^{tree}`], { allowFailure: true })
+    if (treeOk.code !== 0) {
+      throw new Error(`snapshot tree not found in this store: ${snapshot}`)
+    }
+
     const inTree = await this.listTree(snapshot, safe)
     const missing = safe.filter((rel) => !inTree.has(rel))
     const present = safe.filter((rel) => inTree.has(rel))

@@ -420,3 +420,59 @@ test("store: corrupted checkpoint entries are ignored on load", async () => {
   fresh.load({ getEntries: () => entries });
   assert.equal(fresh.peekReverted(), undefined);
 });
+
+test("undo: cannot undo the first message in place", async () => {
+  const { store, run } = setup();
+  store.add(makeCheckpoint({ beforeLeafId: null }));
+  const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", null)]);
+  await run("undo", ctx);
+  assert.equal(
+    ui.notifications[0],
+    "Cannot undo the first message in place; fork before it instead",
+  );
+  assert.deepEqual(navigations, []);
+  assert.equal(store.peekReverted(), undefined);
+});
+
+test("undo: warns when the prompt had image attachments", async () => {
+  const { store, run } = setup();
+  store.add(makeCheckpoint({ imageCount: 2, files: [] }));
+  const { ctx, ui } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  await run("undo", ctx);
+  assert.ok(
+    ui.notifications.some((message) => /2 image attachment/.test(message)),
+    "image note is shown",
+  );
+});
+
+test("undo: a new message clears the redo stack", async () => {
+  const { store, run } = setup();
+  store.add(makeCheckpoint({}));
+  store.markReverted(store.get("u1")!);
+  assert.equal(store.peekReverted()?.userEntryId, "u1");
+
+  // A new message starts: capture clears the reverted state.
+  store.clearRevert();
+  const { ctx, ui } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  await run("redo", ctx);
+  assert.equal(ui.notifications[0], "Nothing to redo");
+});
+
+test("store: two undos in a row target the previous message", async () => {
+  const { store, appended } = setup();
+  store.add(makeCheckpoint({ userEntryId: "u1", beforeLeafId: "l0", files: ["a.txt"] }));
+  store.add(makeCheckpoint({ userEntryId: "u2", beforeLeafId: "l4", files: ["b.txt"] }));
+  appended.length = 0;
+
+  const branchBoth = [
+    makeEntry("u1", "user", "l0"),
+    makeEntry("a1", "assistant", "u1"),
+    makeEntry("u2", "user", "l4"),
+    makeEntry("a2", "assistant", "u2"),
+  ];
+  assert.equal(store.latestOnBranch(branchBoth as never)?.userEntryId, "u2");
+
+  // After undoing u2 the branch no longer contains it.
+  const branchAfterFirst = branchBoth.slice(0, 2);
+  assert.equal(store.latestOnBranch(branchAfterFirst as never)?.userEntryId, "u1");
+});
