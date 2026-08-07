@@ -23,52 +23,6 @@ const MAX_LARGE_EXCLUDES = 1000
 const STAT_CONCURRENCY = 8
 const MAX_NESTED_SCAN = 5000
 
-// Matched at any depth in every project. These are regenerated or app-owned,
-// never worth snapshotting: dependencies, build output, tool caches.
-const DEFAULT_EXCLUDES: string[] = [
-  "node_modules",
-  "Pods",
-  "vendor",
-  "dist",
-  "build",
-  "target",
-  ".next",
-  "coverage",
-  ".venv",
-  "Library",
-  "AppData",
-  ".cache",
-  ".gradle",
-  ".android",
-  ".npm",
-  ".yarn",
-  ".rustup",
-  ".cargo",
-  ".nuget",
-  ".pods",
-  ".m2",
-  ".pnpm-store",
-  ".idea",
-  ".terraform",
-  ".svn",
-  ".hg",
-  ".local",
-  ".paseo",
-  ".opencode",
-  ".agent-browser",
-  ".dev-browser",
-  ".antigravity",
-  ".docker",
-  ".expo",
-  ".gem",
-  ".cocoapods",
-  ".nvm",
-  ".mozilla",
-  ".vscode",
-  "snap",
-  "flatpak",
-]
-
 interface GitResult {
   stdout: string
   stderr: string
@@ -426,7 +380,7 @@ export class ShadowGit implements SnapshotRepo {
       if (!this.warnedSkip) {
         this.warnedSkip = true
         this.warn(
-          `pi-undo: ${allowAll.length} files to snapshot exceeds the limit (${maxFiles}); snapshots are skipped for this message. Add extraExcludes to pi-undo.json or raise maxFiles.`,
+          `pi-undo: ${allowAll.length} files to snapshot exceeds the limit (${maxFiles}); snapshots are skipped for this message. Edit excludeDirectories in pi-undo.json or raise maxFiles.`,
         )
       }
       return false
@@ -604,8 +558,7 @@ export class ShadowGit implements SnapshotRepo {
       }
     }
     const lines: string[] = text ? text.split("\n") : []
-    lines.push(...DEFAULT_EXCLUDES)
-    for (const name of this.config.extraExcludes) lines.push(`/${name.replaceAll("\\", "/")}/`)
+    for (const name of this.config.excludeDirectories) lines.push(`/${name.replaceAll("\\", "/")}/`)
     for (const file of this.prunedLargeExcludes(extra)) {
       lines.push(`/${file.replaceAll("\\", "/")}`)
     }
@@ -617,11 +570,11 @@ export class ShadowGit implements SnapshotRepo {
   // snapshot. Without this the exclude file grows without bound (and each
   // pattern slows every tree walk).
   private prunedLargeExcludes(list: string[]): string[] {
-    const defaultNames = new Set(DEFAULT_EXCLUDES)
-    const prefixes = this.config.extraExcludes
+    const excludeNames = new Set(this.config.excludeDirectories)
+    const prefixes = this.config.excludeDirectories
     return list.filter((file) => {
       const norm = file.replaceAll("\\", "/")
-      if (norm.split("/").some((part) => defaultNames.has(part))) return false
+      if (norm.split("/").some((part) => excludeNames.has(part))) return false
       return !prefixes.some((prefix) => norm === prefix || norm.startsWith(`${prefix}/`))
     })
   }

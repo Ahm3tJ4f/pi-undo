@@ -14,7 +14,7 @@ export default function (pi: ExtensionAPI): void {
     getGit(ctx) {
       const notify = (message: string) => ctx.ui.notify(message, "warning")
       if (!git || git.cwd !== ctx.cwd) {
-        git = new ShadowGit(pi, ctx.cwd, notify, loadPiUndoConfig(ctx.cwd, ctx.isProjectTrusted()))
+        git = new ShadowGit(pi, ctx.cwd, notify, loadPiUndoConfig())
       } else {
         git.setWarn(notify)
       }

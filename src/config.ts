@@ -1,53 +1,111 @@
-import { readFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
-import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent"
+import { getAgentDir } from "@earendil-works/pi-coding-agent"
 
 export interface PiUndoConfig {
-  extraExcludes: string[]
+  excludeDirectories: string[]
   maxFiles: number
 }
 
 export const DEFAULT_MAX_FILES = 100_000
 
+// Matched at any depth in every project. These are regenerated or app-owned,
+// never worth snapshotting: dependencies, build output, tool caches.
+export const DEFAULT_EXCLUDE_DIRECTORIES: string[] = [
+  "node_modules",
+  "Pods",
+  "vendor",
+  "dist",
+  "build",
+  "target",
+  ".next",
+  "coverage",
+  ".venv",
+  "Library",
+  "AppData",
+  ".cache",
+  ".gradle",
+  ".android",
+  ".npm",
+  ".yarn",
+  ".rustup",
+  ".cargo",
+  ".nuget",
+  ".pods",
+  ".m2",
+  ".pnpm-store",
+  ".idea",
+  ".terraform",
+  ".svn",
+  ".hg",
+  ".local",
+  ".paseo",
+  ".opencode",
+  ".agent-browser",
+  ".dev-browser",
+  ".antigravity",
+  ".docker",
+  ".expo",
+  ".gem",
+  ".cocoapods",
+  ".nvm",
+  ".mozilla",
+  ".vscode",
+  "snap",
+  "flatpak",
+]
+
 export const DEFAULT_CONFIG: PiUndoConfig = {
-  extraExcludes: [],
+  excludeDirectories: DEFAULT_EXCLUDE_DIRECTORIES,
   maxFiles: DEFAULT_MAX_FILES,
 }
 
 /**
- * Load pi-undo.json configuration.
+ * Load the pi-undo.json config file: <agent dir>/pi-undo.json
+ * (e.g. ~/.pi/agent/pi-undo.json).
  *
- * Global: <agent dir>/pi-undo.json (e.g. ~/.pi/agent/pi-undo.json)
- * Project: <cwd>/.pi/pi-undo.json, only honored for trusted projects.
+ * When the file does not exist it is created with the default values, so the
+ * user can open it and add or remove entries. The values in the file are the
+ * complete effective configuration: removing an entry from
+ * excludeDirectories really un-excludes that directory.
  *
- * Project values override global values. extraExcludes are merged.
+ * If a key is missing or invalid, the default for that key is used.
  */
-export function loadPiUndoConfig(
-  cwd: string,
-  trusted: boolean,
-  globalPath?: string,
-): PiUndoConfig {
-  const global = readConfigFile(globalPath ?? path.join(getAgentDir(), "pi-undo.json"))
-  const project = trusted ? readConfigFile(path.join(cwd, CONFIG_DIR_NAME, "pi-undo.json")) : {}
+export function loadPiUndoConfig(globalPath?: string): PiUndoConfig {
+  const file = globalPath ?? path.join(getAgentDir(), "pi-undo.json")
+  if (!existsSync(file)) writeDefaults(file)
+  const config = readConfigFile(file)
   return {
-    extraExcludes: [...new Set([...(global.extraExcludes ?? []), ...(project.extraExcludes ?? [])])],
-    maxFiles: project.maxFiles ?? global.maxFiles ?? DEFAULT_MAX_FILES,
+    excludeDirectories: config.excludeDirectories ?? DEFAULT_EXCLUDE_DIRECTORIES,
+    maxFiles: config.maxFiles ?? DEFAULT_MAX_FILES,
+  }
+}
+
+function writeDefaults(file: string): void {
+  try {
+    mkdirSync(path.dirname(file), { recursive: true })
+    writeFileSync(file, JSON.stringify(DEFAULT_CONFIG, null, 2) + "\n")
+  } catch {
+    // Best effort: if the file cannot be created, the in-memory defaults are
+    // still used.
   }
 }
 
 function readConfigFile(file: string): Partial<PiUndoConfig> {
   try {
     const raw = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>
-    const extraExcludes = Array.isArray(raw.extraExcludes)
-      ? raw.extraExcludes.filter((value): value is string => typeof value === "string")
+    const excludeDirectories = Array.isArray(raw.excludeDirectories)
+      ? raw.excludeDirectories.filter(
+          (value): value is string => typeof value === "string" && value.length > 0,
+        )
       : undefined
     const maxFiles =
       typeof raw.maxFiles === "number" && Number.isFinite(raw.maxFiles) && raw.maxFiles > 0
         ? raw.maxFiles
         : undefined
     return {
-      ...(extraExcludes ? { extraExcludes } : {}),
-      ...(maxFiles ? { maxFiles } : {}),
+      ...(excludeDirectories !== undefined ? { excludeDirectories } : {}),
+      ...(maxFiles !== undefined ? { maxFiles } : {}),
     }
   } catch {
     return {}

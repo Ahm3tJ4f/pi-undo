@@ -30,41 +30,24 @@ restart.
 - **Two snapshots per message.** Each user message gets a before and an
   after tree hash. Undo restores only the files that message changed.
 
-## What is not snapshotted
-
-A built-in blacklist skips directories that are never worth undoing:
-
-- **Dependencies and build output:** `node_modules`, `Pods`, `vendor`,
-  `dist`, `build`, `target`, `.next`, `coverage`, `.venv`, `venv`
-- **Tool caches and app data:** `Library`, `AppData`, `.cache`, `.gradle`,
-  `.android`, `.npm`, `.yarn`, `.rustup`, `.cargo`, `.nuget`, `.m2`,
-  `.pnpm-store`, `.idea`, `.terraform`
-
-These names are matched at any depth, so `some/project/node_modules` is
-skipped inside any folder, not just at the top level.
-
-Nested git repositories are excluded from snapshots automatically (they
-are covered by their own repo).
-
 ## Configuration
 
-Create a `pi-undo.json` file:
-
-- Global: `~/.pi/agent/pi-undo.json`
-- Project: `.pi/pi-undo.json` (only honored for trusted projects)
-
-Project values override global values.
+pi-undo reads one config file: `~/.pi/agent/pi-undo.json`. On the first run
+the file is created with the default values, and you edit it directly to
+change them. Add or remove names in `excludeDirectories`, or change
+`maxFiles`. The list in the file is the complete list: removing an entry
+really un-excludes that directory.
 
 ```json
 {
-  "extraExcludes": ["Downloads", "tmp"],
+  "excludeDirectories": ["node_modules", "dist", "Downloads", "tmp"],
   "maxFiles": 100000
 }
 ```
 
 | Field | What it does |
 | -------- | ------------ |
-| `extraExcludes` | Additional directory names to skip, matched at any depth |
+| `excludeDirectories` | Directory names never snapshotted, matched at any depth |
 | `maxFiles` | Snapshot size cap (default 100000). Over this, snapshots are skipped for that message with a one-time warning instead of making pi slow |
 
 ## Commands

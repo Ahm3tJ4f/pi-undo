@@ -478,71 +478,89 @@ test("default junk dirs are not snapshotted", async () => {
   }
 });
 
-test("project pi-undo.json extraExcludes are honored for trusted projects", async () => {
-  const dir = await newTempDir("pi-undo-extra-");
+test("config: file is created with defaults when missing", async () => {
+  const dir = await newTempDir("pi-undo-config-new-");
   try {
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    await mkdir(path.join(dir, "myjunk"));
-    await writeFile(path.join(dir, "myjunk", "j.txt"), "x\n");
-    await mkdir(path.join(dir, ".pi"));
-    await writeFile(
-      path.join(dir, ".pi", "pi-undo.json"),
-      JSON.stringify({ extraExcludes: ["myjunk"] }),
-    );
+    const configFile = path.join(dir, "pi-undo.json");
+    const config = loadPiUndoConfig(configFile);
+    assert.ok(config.excludeDirectories.includes("node_modules"));
+    assert.equal(config.maxFiles, 100000);
 
-    const git = new ShadowGit(fakePi(), dir, undefined, loadPiUndoConfig(dir, true));
+    const raw = JSON.parse(await readFile(configFile, "utf8")) as {
+      excludeDirectories?: unknown;
+      maxFiles?: unknown;
+    };
+    assert.ok(
+      Array.isArray(raw.excludeDirectories) &&
+        raw.excludeDirectories.includes("node_modules"),
+      "created file contains the default excludes",
+    );
+    assert.equal(raw.maxFiles, 100000);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("config: user edits to excludeDirectories and maxFiles are honored", async () => {
+  const dir = await newTempDir("pi-undo-config-edit-");
+  try {
+    const configFile = path.join(dir, "pi-undo.json");
+    await writeFile(
+      configFile,
+      JSON.stringify({ excludeDirectories: ["Downloads", "tmp"], maxFiles: 7 }),
+    );
+    const config = loadPiUndoConfig(configFile);
+    assert.deepEqual(config.excludeDirectories, ["Downloads", "tmp"]);
+    assert.equal(config.maxFiles, 7);
+
+    // A directory named in the file is excluded from snapshots.
+    await mkdir(path.join(dir, "Downloads"));
+    await writeFile(path.join(dir, "Downloads", "d.txt"), "x\n");
+    const git = new ShadowGit(fakePi(), dir, undefined, config);
     await git.ensure();
     const before = await tracked(git);
 
-    await writeFile(path.join(dir, "myjunk", "j.txt"), "y\n");
+    await writeFile(path.join(dir, "Downloads", "d.txt"), "y\n");
     await writeFile(path.join(dir, "b.txt"), "two\n");
     const after = await tracked(git);
-
     assert.deepEqual(await git.changedFiles(before, after), ["b.txt"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("project pi-undo.json is ignored for untrusted projects", async () => {
-  const dir = await newTempDir("pi-undo-untrusted-");
+test("config: empty excludeDirectories re-enables default dirs", async () => {
+  const dir = await newTempDir("pi-undo-config-empty-");
   try {
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    await mkdir(path.join(dir, "myjunk"));
-    await writeFile(path.join(dir, "myjunk", "j.txt"), "x\n");
-    await mkdir(path.join(dir, ".pi"));
-    await writeFile(
-      path.join(dir, ".pi", "pi-undo.json"),
-      JSON.stringify({ extraExcludes: ["myjunk"] }),
-    );
+    const configFile = path.join(dir, "pi-undo.json");
+    await writeFile(configFile, JSON.stringify({ excludeDirectories: [] }));
+    const config = loadPiUndoConfig(configFile);
+    assert.deepEqual(config.excludeDirectories, []);
 
-    const git = new ShadowGit(fakePi(), dir, undefined, loadPiUndoConfig(dir, false));
+    // node_modules is tracked again once the user removed it.
+    const git = new ShadowGit(fakePi(), dir, undefined, config);
     await git.ensure();
     const before = await tracked(git);
-
-    await writeFile(path.join(dir, "myjunk", "j.txt"), "y\n");
+    await mkdir(path.join(dir, "node_modules"));
+    await writeFile(path.join(dir, "node_modules", "m.js"), "x\n");
     const after = await tracked(git);
-
-    assert.deepEqual(await git.changedFiles(before, after), ["myjunk/j.txt"]);
+    assert.deepEqual(await git.changedFiles(before, after), ["node_modules/m.js"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("global pi-undo.json merges and project maxFiles wins", async () => {
-  const dir = await newTempDir("pi-undo-global-");
-  const globalFile = path.join(dir, "global.json");
+test("config: invalid values fall back to defaults", async () => {
+  const dir = await newTempDir("pi-undo-config-invalid-");
   try {
-    await writeFile(globalFile, JSON.stringify({ extraExcludes: ["g1"], maxFiles: 500 }));
-    await mkdir(path.join(dir, ".pi"));
-    await writeFile(path.join(dir, ".pi", "pi-undo.json"), JSON.stringify({ maxFiles: 7 }));
-
-    const config = loadPiUndoConfig(dir, true, globalFile);
-    assert.deepEqual(config.extraExcludes, ["g1"]);
-    assert.equal(config.maxFiles, 7);
-
-    const untrusted = loadPiUndoConfig(dir, false, globalFile);
-    assert.equal(untrusted.maxFiles, 500);
+    const configFile = path.join(dir, "pi-undo.json");
+    await writeFile(
+      configFile,
+      JSON.stringify({ excludeDirectories: "nope", maxFiles: -3 }),
+    );
+    const config = loadPiUndoConfig(configFile);
+    assert.ok(config.excludeDirectories.includes("node_modules"));
+    assert.equal(config.maxFiles, 100000);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -554,7 +572,7 @@ test("file cap skips snapshots with a warning", async () => {
     for (let i = 0; i < 6; i++) {
       await writeFile(path.join(dir, `f${i}.txt`), "x\n");
     }
-    const git = new ShadowGit(fakePi(), dir, undefined, { extraExcludes: [], maxFiles: 5 });
+    const git = new ShadowGit(fakePi(), dir, undefined, { excludeDirectories: [], maxFiles: 5 });
     await git.ensure();
     assert.equal(await git.track(), undefined);
   } finally {
