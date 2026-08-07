@@ -6,7 +6,11 @@ import { isUserMessageEntry } from "./types.ts"
 import { errorMessage } from "./util.ts"
 
 export interface CaptureDeps {
-  getGit(ctx: { cwd: string; ui: Pick<ExtensionUIContext, "notify"> }): SnapshotRepo
+  getGit(ctx: {
+    cwd: string
+    ui: Pick<ExtensionUIContext, "notify">
+    isProjectTrusted: () => boolean
+  }): SnapshotRepo
 }
 
 export function setupCapture(pi: ExtensionAPI, store: CheckpointStore, deps: CaptureDeps): void {
@@ -26,7 +30,7 @@ export function setupCapture(pi: ExtensionAPI, store: CheckpointStore, deps: Cap
         imageCount: event.images?.length ?? 0,
         userEntryId: null,
         beforeLeafId: null,
-        beforeSnapshot,
+        beforeSnapshot: beforeSnapshot ?? null,
       }
     } catch (error) {
       active = null
@@ -56,6 +60,7 @@ export function setupCapture(pi: ExtensionAPI, store: CheckpointStore, deps: Cap
     try {
       const git = deps.getGit(ctx)
       const afterSnapshot = await git.track()
+      if (!afterSnapshot) return
       const files = await git.changedFiles(turn.beforeSnapshot, afterSnapshot)
       store.add({
         userEntryId: turn.userEntryId,

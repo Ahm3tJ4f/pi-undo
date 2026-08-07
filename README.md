@@ -47,3 +47,24 @@ pi install npm:@ahm3tj4f/pi-undo
 
 pi install git:github.com/ahm3tj4f/pi-undo
 ```
+
+## Configuration
+
+Create a `pi-undo.json` file:
+
+- Global: `~/.pi/agent/pi-undo.json`
+- Project: `.pi/pi-undo.json` (only honored for trusted projects)
+
+Project values override global values.
+
+```json
+{
+  "extraExcludes": ["Downloads", "tmp"],
+  "maxFiles": 100000
+}
+```
+
+| Field | What it does |
+| -------- | ------------ |
+| `extraExcludes` | Additional directory names to skip, matched at any depth |
+| `maxFiles` | Snapshot size cap (default 100000). Over this, snapshots are skipped for that message with a one-time warning instead of making pi slow |

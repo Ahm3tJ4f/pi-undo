@@ -4,6 +4,7 @@ import { copyFile, lstat, mkdir, readFile, readdir, rm, stat as fsStat, writeFil
 import { homedir, tmpdir } from "node:os"
 import path from "node:path"
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
+import { DEFAULT_CONFIG, type PiUndoConfig } from "./config.ts"
 import type { NumstatRow } from "./util.ts"
 import { literalPathspec, normalizeGitPath, nulSplit, unique } from "./util.ts"
 
@@ -52,7 +53,7 @@ export interface DiffStatResult {
 
 export interface SnapshotRepo {
   ensure(): Promise<void>
-  track(): Promise<string>
+  track(): Promise<string | undefined>
   changedFiles(from: string, to: string): Promise<string[]>
   dirtySince(snapshot: string): Promise<string[]>
   restoreSnapshot(snapshot: string, files: string[]): Promise<RestoreResult>
@@ -63,16 +64,24 @@ export interface SnapshotRepo {
 
 export class ShadowGit implements SnapshotRepo {
   readonly cwd: string
-  private readonly pi: ExtensionAPI
+  private readonly pi: Pick<ExtensionAPI, "exec">
   private readonly gitdir: string
+  private readonly config: PiUndoConfig
   private initialized = false
   private warn: (message: string) => void
   private warnedExcludes = ""
+  private warnedSkip = false
 
-  constructor(pi: ExtensionAPI, cwd: string, warn: (message: string) => void = () => {}) {
+  constructor(
+    pi: Pick<ExtensionAPI, "exec">,
+    cwd: string,
+    warn: (message: string) => void = () => {},
+    config: PiUndoConfig = DEFAULT_CONFIG,
+  ) {
     this.pi = pi
     this.cwd = cwd
     this.warn = warn
+    this.config = config
     const key = createHash("sha256").update(cwd).digest("hex").slice(0, 24)
     this.gitdir = path.join(snapshotStoreRoot(), key)
   }
@@ -113,9 +122,9 @@ export class ShadowGit implements SnapshotRepo {
   }
 
   
-  async track(): Promise<string> {
+  async track(): Promise<string | undefined> {
     await this.ensure()
-    await this.add()
+    if (!(await this.add())) return undefined
     const result = await this.git(["write-tree"])
     return result.stdout.trim()
   }
@@ -346,7 +355,7 @@ export class ShadowGit implements SnapshotRepo {
   }
 
   
-  private async add(): Promise<void> {
+  private async add(): Promise<boolean> {
     const meta = await this.readMeta()
     await this.syncExcludes(meta.largeExcludes ?? [])
     const [changed, untracked] = await Promise.all([
@@ -358,13 +367,8 @@ export class ShadowGit implements SnapshotRepo {
     const all = unique([...nulSplit(changed.stdout), ...nulSplit(untracked.stdout)])
       .map(normalizeGitPath)
       .filter((f): f is string => Boolean(f))
-    if (all.length === 0) return
+    if (all.length === 0) return true
 
-    
-    
-    
-    
-    
     const nested = new Set<string>()
     for (const file of all) {
       if (!file.endsWith("/")) continue
@@ -383,13 +387,22 @@ export class ShadowGit implements SnapshotRepo {
     }
     const allowAll = all.filter((file) => !nested.has(file))
 
+    const maxFiles = this.config.maxFiles
+    if (allowAll.length > maxFiles) {
+      if (!this.warnedSkip) {
+        this.warnedSkip = true
+        this.warn(
+          `pi-undo: ${allowAll.length} files to snapshot exceeds the limit (${maxFiles}); snapshots are skipped for this message. Add extraExcludes to pi-undo.json or raise maxFiles.`,
+        )
+      }
+      return false
+    }
+
     const ignored = await this.checkIgnored(allowAll)
     if (ignored.size > 0) await this.dropPaths([...ignored])
     const allow = allowAll.filter((file) => !ignored.has(file))
-    if (allow.length === 0) return
+    if (allow.length === 0) return true
 
-    
-    
     const untrackedSet = new Set(
       nulSplit(untracked.stdout).map(normalizeGitPath).filter((f): f is string => Boolean(f)),
     )
@@ -412,6 +425,7 @@ export class ShadowGit implements SnapshotRepo {
     }
 
     await this.stagePaths(allow.filter((file) => !large.has(file)))
+    return true
   }
 
   
@@ -579,7 +593,9 @@ export class ShadowGit implements SnapshotRepo {
         text = (await readFile(excludePath, "utf8")).trimEnd()
       }
     }
-    const lines = [...(text ? text.split("\n") : []), ...extra.map((file) => `/${file.replaceAll("\\", "/")}`)]
+    const lines = [...(text ? text.split("\n") : [])]
+    for (const name of this.config.extraExcludes) lines.push(`/${name.replaceAll("\\", "/")}/`)
+    lines.push(...extra.map((file) => `/${file.replaceAll("\\", "/")}`))
     await mkdir(path.join(this.gitdir, "info"), { recursive: true })
     await writeFile(path.join(this.gitdir, "info", "exclude"), lines.join("\n") + "\n")
   }

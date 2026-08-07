@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir, homedir } from "node:os";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 
 import { ShadowGit, snapshotStoreRoot } from "../src/git.ts";
+import { loadPiUndoConfig } from "../src/config.ts";
 
 process.env.PI_UNDO_STORE_ROOT = path.join(tmpdir(), `pi-undo-test-store-${process.pid}`);
 
@@ -58,6 +59,12 @@ async function newShadow(cwd: string): Promise<ShadowGit> {
   return git;
 }
 
+async function tracked(git: ShadowGit): Promise<string> {
+  const snapshot = await git.track();
+  assert.ok(snapshot, "track() returned undefined");
+  return snapshot;
+}
+
 async function makeSourceRepo(
   cwd: string,
   files: Record<string, string>,
@@ -81,13 +88,13 @@ test("tracks, diffs and verifies in a non-git directory", async () => {
     await writeFile(path.join(dir, "sub", "b.txt"), "two\n");
 
     const git = await newShadow(dir);
-    const before = await git.track();
+    const before = await tracked(git);
     assert.match(before, /^[0-9a-f]{40}$/);
 
     await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
     await writeFile(path.join(dir, "c.txt"), "three\n");
 
-    const after = await git.track();
+    const after = await tracked(git);
     assert.notEqual(after, before);
     assert.deepEqual((await git.changedFiles(before, after)).sort(), [
       "a.txt",
@@ -107,7 +114,7 @@ test("tracks, diffs and verifies in a non-git directory", async () => {
     assert.equal(await git.verifySnapshot(before), true);
 
     
-    assert.equal(await git.track(), before);
+    assert.equal(await tracked(git), before);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -120,11 +127,11 @@ test("ignored files are not snapshotted and not dirty", async () => {
     await writeFile(path.join(dir, "a.txt"), "one\n");
 
     const git = await newShadow(dir);
-    const before = await git.track();
+    const before = await tracked(git);
 
     await writeFile(path.join(dir, "x.log"), "noise\n");
     await writeFile(path.join(dir, "b.txt"), "two\n");
-    const after = await git.track();
+    const after = await tracked(git);
 
     assert.deepEqual(await git.changedFiles(before, after), ["b.txt"]);
     assert.deepEqual(await git.dirtySince(after), []);
@@ -140,11 +147,11 @@ test("untracked files over the size cap are excluded from snapshots", async () =
   try {
     await writeFile(path.join(dir, "a.txt"), "one\n");
     const git = await newShadow(dir);
-    const before = await git.track();
+    const before = await tracked(git);
 
     const big = Buffer.alloc(2 * 1024 * 1024 + 1, 0x61);
     await writeFile(path.join(dir, "big.bin"), big);
-    const after = await git.track();
+    const after = await tracked(git);
 
     assert.deepEqual(await git.changedFiles(before, after), []);
     
@@ -161,7 +168,7 @@ test("seeds from the source repo: no blobs are stored twice", async () => {
 
     const git = await newShadow(dir);
 
-    const before = await git.track();
+    const before = await tracked(git);
     assert.match(before, /^[0-9a-f]{40}$/);
 
     
@@ -181,7 +188,7 @@ test("seeds from the source repo: no blobs are stored twice", async () => {
 
     
     await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
-    const after = await git.track();
+    const after = await tracked(git);
     assert.deepEqual(await git.changedFiles(before, after), ["a.txt"]);
 
     
@@ -207,11 +214,11 @@ test("source repo ignore rules (info/exclude) are honored", async () => {
     );
 
     const git = await newShadow(dir);
-    const before = await git.track();
+    const before = await tracked(git);
 
     await writeFile(path.join(dir, "secret.tmp"), "nope\n");
     await writeFile(path.join(dir, "b.txt"), "two\n");
-    const after = await git.track();
+    const after = await tracked(git);
 
     assert.deepEqual(await git.changedFiles(before, after), ["b.txt"]);
     assert.deepEqual(await git.dirtySince(after), []);
@@ -225,14 +232,14 @@ test("file to directory transitions restore correctly", async () => {
   try {
     await writeFile(path.join(dir, "a.txt"), "one\n");
     const git = await newShadow(dir);
-    const before = await git.track();
+    const before = await tracked(git);
 
     
     await rm(path.join(dir, "a.txt"));
     await mkdir(path.join(dir, "a"));
     await writeFile(path.join(dir, "a", "b.txt"), "two\n");
 
-    const after = await git.track();
+    const after = await tracked(git);
     const files = (await git.changedFiles(before, after)).sort();
     assert.ok(files.includes("a.txt"));
     assert.ok(files.includes("a/b.txt"));
@@ -252,12 +259,12 @@ test("directory to file transitions restore correctly", async () => {
     await mkdir(path.join(dir, "a"));
     await writeFile(path.join(dir, "a", "b.txt"), "two\n");
     const git = await newShadow(dir);
-    const before = await git.track();
+    const before = await tracked(git);
 
     await rm(path.join(dir, "a"), { recursive: true });
     await writeFile(path.join(dir, "a.txt"), "one\n");
 
-    const after = await git.track();
+    const after = await tracked(git);
     const files = (await git.changedFiles(before, after)).sort();
     assert.ok(files.includes("a/b.txt"));
 
@@ -276,12 +283,12 @@ test("numstat: parses add/remove stats between snapshots", async () => {
     await writeFile(path.join(dir, "a.txt"), "one\n");
     await writeFile(path.join(dir, "bin.dat"), "binary");
     const git = await newShadow(dir);
-    const before = await git.track();
+    const before = await tracked(git);
 
     await writeFile(path.join(dir, "a.txt"), "one\ntwo\nthree\n");
     await writeFile(path.join(dir, "bin.dat"), Buffer.alloc(64, 0x00));
     await writeFile(path.join(dir, "c.txt"), "new\n");
-    const after = await git.track();
+    const after = await tracked(git);
 
     const { rows, binaryCount } = await git.diffNumstat(before, after);
     const byFile = new Map(rows.map((row) => [row.file, row]));
@@ -300,10 +307,10 @@ test("numstat: filenames containing tabs parse correctly", async () => {
   try {
     await writeFile(path.join(dir, "weird\tname.txt"), "one\n");
     const git = await newShadow(dir);
-    const before = await git.track();
+    const before = await tracked(git);
 
     await writeFile(path.join(dir, "weird\tname.txt"), "one\ntwo\n");
-    const after = await git.track();
+    const after = await tracked(git);
 
     const { rows } = await git.diffNumstat(before, after);
     assert.equal(rows.length, 1);
@@ -321,12 +328,12 @@ test("restore: never deletes or writes through a symlinked parent directory", as
     await mkdir(path.join(dir, "a"))
     await writeFile(path.join(dir, "a", "keep.txt"), "keep\n")
     const git = await newShadow(dir)
-    const before = await git.track()
+    const before = await tracked(git)
 
     
     await writeFile(path.join(dir, "a", "keep.txt"), "agent changed\n")
     await writeFile(path.join(dir, "a", "new.txt"), "agent created\n")
-    const after = await git.track()
+    const after = await tracked(git)
     const files = (await git.changedFiles(before, after)).sort()
     assert.deepEqual(files, ["a/keep.txt", "a/new.txt"])
 
@@ -360,12 +367,12 @@ test("tracked files that become ignored are dropped from snapshots", async () =>
   try {
     await writeFile(path.join(dir, "a.txt"), "one\n");
     const git = await newShadow(dir);
-    const before = await git.track();
+    const before = await tracked(git);
 
     
     await writeFile(path.join(dir, ".gitignore"), "a.txt\n");
     await writeFile(path.join(dir, "a.txt"), "changed\n");
-    const after = await git.track();
+    const after = await tracked(git);
 
     
     
@@ -383,11 +390,11 @@ test("gc runs on a seeded repo", async () => {
   try {
     await makeSourceRepo(dir, { "a.txt": "one\n" });
     const git = await newShadow(dir);
-    await git.track();
+    await tracked(git);
     await git.gcIfDue();
     
     await writeFile(path.join(dir, "b.txt"), "two\n");
-    const tree = await git.track();
+    const tree = await tracked(git);
     assert.match(tree, /^[0-9a-f]{40}$/);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -425,13 +432,13 @@ test("nested git repos are excluded: edits inside them are not undoable", async 
     await writeFile(path.join(empty, "f.txt"), "old\n");
 
     const git = await newShadow(dir);
-    const before = await git.track();
+    const before = await tracked(git);
 
     
     await writeFile(path.join(dir, "root.txt"), "edited\n");
     await writeFile(path.join(dir, "nested", "g.txt"), "edited\n");
     await writeFile(path.join(empty, "f.txt"), "edited\n");
-    const after = await git.track();
+    const after = await tracked(git);
 
     
     assert.deepEqual(await git.changedFiles(before, after), ["root.txt"]);
@@ -442,6 +449,90 @@ test("nested git repos are excluded: edits inside them are not undoable", async 
     assert.equal(await readFile(path.join(dir, "nested", "g.txt"), "utf8"), "edited\n");
     assert.equal(await readFile(path.join(empty, "f.txt"), "utf8"), "edited\n");
     assert.equal(await git.verifySnapshot(before), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("project pi-undo.json extraExcludes are honored for trusted projects", async () => {
+  const dir = await newTempDir("pi-undo-extra-");
+  try {
+    await writeFile(path.join(dir, "a.txt"), "one\n");
+    await mkdir(path.join(dir, "myjunk"));
+    await writeFile(path.join(dir, "myjunk", "j.txt"), "x\n");
+    await mkdir(path.join(dir, ".pi"));
+    await writeFile(
+      path.join(dir, ".pi", "pi-undo.json"),
+      JSON.stringify({ extraExcludes: ["myjunk"] }),
+    );
+
+    const git = new ShadowGit(fakePi() as unknown as ExtensionAPI, dir, undefined, loadPiUndoConfig(dir, true));
+    await git.ensure();
+    const before = await tracked(git);
+
+    await writeFile(path.join(dir, "myjunk", "j.txt"), "y\n");
+    await writeFile(path.join(dir, "b.txt"), "two\n");
+    const after = await tracked(git);
+
+    assert.deepEqual(await git.changedFiles(before, after), ["b.txt"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("project pi-undo.json is ignored for untrusted projects", async () => {
+  const dir = await newTempDir("pi-undo-untrusted-");
+  try {
+    await writeFile(path.join(dir, "a.txt"), "one\n");
+    await mkdir(path.join(dir, "myjunk"));
+    await writeFile(path.join(dir, "myjunk", "j.txt"), "x\n");
+    await mkdir(path.join(dir, ".pi"));
+    await writeFile(
+      path.join(dir, ".pi", "pi-undo.json"),
+      JSON.stringify({ extraExcludes: ["myjunk"] }),
+    );
+
+    const git = new ShadowGit(fakePi() as unknown as ExtensionAPI, dir, undefined, loadPiUndoConfig(dir, false));
+    await git.ensure();
+    const before = await tracked(git);
+
+    await writeFile(path.join(dir, "myjunk", "j.txt"), "y\n");
+    const after = await tracked(git);
+
+    assert.deepEqual(await git.changedFiles(before, after), ["myjunk/j.txt"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("global pi-undo.json merges and project maxFiles wins", async () => {
+  const dir = await newTempDir("pi-undo-global-");
+  const globalFile = path.join(dir, "global.json");
+  try {
+    await writeFile(globalFile, JSON.stringify({ extraExcludes: ["g1"], maxFiles: 500 }));
+    await mkdir(path.join(dir, ".pi"));
+    await writeFile(path.join(dir, ".pi", "pi-undo.json"), JSON.stringify({ maxFiles: 7 }));
+
+    const config = loadPiUndoConfig(dir, true, globalFile);
+    assert.deepEqual(config.extraExcludes, ["g1"]);
+    assert.equal(config.maxFiles, 7);
+
+    const untrusted = loadPiUndoConfig(dir, false, globalFile);
+    assert.equal(untrusted.maxFiles, 500);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("file cap skips snapshots with a warning", async () => {
+  const dir = await newTempDir("pi-undo-cap-");
+  try {
+    for (let i = 0; i < 6; i++) {
+      await writeFile(path.join(dir, `f${i}.txt`), "x\n");
+    }
+    const git = new ShadowGit(fakePi() as unknown as ExtensionAPI, dir, undefined, { extraExcludes: [], maxFiles: 5 });
+    await git.ensure();
+    assert.equal(await git.track(), undefined);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

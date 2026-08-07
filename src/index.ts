@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { setupCapture, type CaptureDeps } from "./capture.ts"
 import { registerCommands } from "./commands.ts"
+import { loadPiUndoConfig } from "./config.ts"
 import { ShadowGit } from "./git.ts"
 import { CheckpointStore } from "./store.ts"
 import { errorMessage } from "./util.ts"
@@ -12,8 +13,11 @@ export default function (pi: ExtensionAPI): void {
   const deps: CaptureDeps = {
     getGit(ctx) {
       const notify = (message: string) => ctx.ui.notify(message, "warning")
-      if (!git || git.cwd !== ctx.cwd) git = new ShadowGit(pi, ctx.cwd, notify)
-      else git.setWarn(notify)
+      if (!git || git.cwd !== ctx.cwd) {
+        git = new ShadowGit(pi, ctx.cwd, notify, loadPiUndoConfig(ctx.cwd, ctx.isProjectTrusted()))
+      } else {
+        git.setWarn(notify)
+      }
       return git
     },
   }
