@@ -1,6 +1,6 @@
 {
   "name": "@ahm3tj4f/pi-undo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Undo/redo for pi, but this time it works. Per-message snapshots, ported from OpenCode's exact undo/redo philosophy.",
   "license": "MIT",
   "type": "module",
