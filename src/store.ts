@@ -7,17 +7,24 @@ import type { Checkpoint, RevertState } from "./types.ts";
 export const CHECKPOINT_TYPE = "pi-undo/checkpoint";
 export const REVERT_TYPE = "pi-undo/revert";
 
+/** The subset of session entries that CheckpointStore reads on reload. */
+interface StoreEntry {
+  type: string
+  customType?: string
+  data?: unknown
+}
+
 export class CheckpointStore {
-  private readonly pi: ExtensionAPI;
+  private readonly pi: Pick<ExtensionAPI, "appendEntry">;
   private readonly checkpoints = new Map<string, Checkpoint>();
   
   private reverted: Checkpoint[] = [];
 
-  constructor(pi: ExtensionAPI) {
+  constructor(pi: Pick<ExtensionAPI, "appendEntry">) {
     this.pi = pi;
   }
 
-  load(sessionManager: { getEntries(): SessionEntry[] }): void {
+  load(sessionManager: { getEntries(): readonly StoreEntry[] }): void {
     this.checkpoints.clear();
     this.reverted = [];
     let lastRevert: RevertState | undefined;
@@ -30,10 +37,10 @@ export class CheckpointStore {
         if (checkpoint)
           this.checkpoints.set(checkpoint.userEntryId, checkpoint);
       } else if (entry.customType === REVERT_TYPE) {
-        lastRevert = entry.data as RevertState | undefined;
+        lastRevert = parseRevert(entry.data);
       }
     }
-    if (lastRevert && Array.isArray(lastRevert.revertedEntryIds)) {
+    if (lastRevert) {
       this.reverted = lastRevert.revertedEntryIds
         .map((id) => this.checkpoints.get(id))
         .filter((cp): cp is Checkpoint => Boolean(cp));
@@ -91,6 +98,14 @@ export class CheckpointStore {
       revertedEntryIds: this.reverted.map((cp) => cp.userEntryId),
     } satisfies RevertState);
   }
+}
+
+function parseRevert(value: unknown): RevertState | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const ids = (value as { revertedEntryIds?: unknown }).revertedEntryIds;
+  if (!Array.isArray(ids) || !ids.every((id): id is string => typeof id === "string"))
+    return undefined;
+  return { revertedEntryIds: ids };
 }
 
 function parseCheckpoint(

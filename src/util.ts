@@ -16,8 +16,12 @@ export function userText(content: unknown): string {
   if (typeof content === "string") return content
   if (!Array.isArray(content)) return ""
   return content
-    .filter((block): block is { type: "text"; text: string } =>
-      Boolean(block && typeof block === "object" && (block as { type?: unknown }).type === "text"),
+    .filter(
+      (block): block is { type: "text"; text: string } => {
+        if (typeof block !== "object" || block === null) return false
+        const candidate = block as { type?: unknown; text?: unknown }
+        return candidate.type === "text" && typeof candidate.text === "string"
+      },
     )
     .map((block) => block.text)
     .join("")

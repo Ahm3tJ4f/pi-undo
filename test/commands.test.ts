@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import type { ExtensionAPI, RegisteredCommand } from "@earendil-works/pi-coding-agent";
+
+import type { CaptureDeps } from "../src/capture.ts";
 import { registerCommands } from "../src/commands.ts";
 import type { SnapshotRepo } from "../src/git.ts";
 import { CheckpointStore } from "../src/store.ts";
@@ -119,28 +122,21 @@ function makeCheckpoint(overrides: Partial<Checkpoint> = {}): Checkpoint {
 
 function setup() {
   const appended: unknown[] = [];
-  const handlers = new Map<
-    string,
-    { handler: (args: string, ctx: unknown) => Promise<void> }
-  >();
-  const fakePi = {
-    appendEntry: (_type: string, data: unknown) => void appended.push(data),
-    registerCommand: (
-      name: string,
-      opts: { handler: (args: string, ctx: unknown) => Promise<void> },
-    ) => {
-      handlers.set(name, opts);
-    },
+  const handlers = new Map<string, Omit<RegisteredCommand, "name" | "sourceInfo">>();
+  const fakePi: Pick<ExtensionAPI, "appendEntry" | "registerCommand"> = {
+    appendEntry: (_type, data) => void appended.push(data),
+    registerCommand: (name, opts) => void handlers.set(name, opts),
   };
-  const store = new CheckpointStore(fakePi as never);
+  const store = new CheckpointStore(fakePi);
   const repoState = makeRepo();
-  const deps = { getGit: () => repoState.repo };
-  registerCommands(fakePi as never, store, deps as never);
+  const deps: CaptureDeps = { getGit: () => repoState.repo };
+  registerCommands(fakePi, store, deps);
   return {
     store,
     appended,
     repoState,
-    run: (name: string, ctx: unknown) => handlers.get(name)!.handler("", ctx),
+    run: (name: string, ctx: unknown) =>
+      (handlers.get(name)!.handler as (args: string, ctx: unknown) => Promise<void>)("", ctx),
   };
 }
 
@@ -269,7 +265,7 @@ test("undo: failed rollback after a bad restore warns about inconsistency", asyn
 test("undo: cancelled navigation rolls the files back to the after state", async () => {
   const { store, repoState, run } = setup();
   store.add(makeCheckpoint({}));
-  const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")], {
+  const { ctx, ui } = sessionCtx([makeEntry("u1", "user", "l0")], {
     navigateCancelled: true,
   });
   await run("undo", ctx);
@@ -326,7 +322,7 @@ test("undo: aborts a running agent first", async () => {
 
 test("redo: nothing to redo when the stack is empty", async () => {
   const { run, repoState } = setup();
-  const { ctx, ui, navigations } = sessionCtx([]);
+  const { ctx, ui } = sessionCtx([]);
   await run("redo", ctx);
   assert.equal(ui.notifications[0], "Nothing to redo");
   assert.deepEqual(repoState.state.calls, []);
@@ -380,7 +376,7 @@ test("diff: shows the preview of what undo would restore", async () => {
   const { store, repoState, run } = setup();
   store.add(makeCheckpoint({}));
   repoState.state.numstat = [{ file: "a.txt", added: 12, removed: 3 }];
-  const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  const { ctx, ui } = sessionCtx([makeEntry("u1", "user", "l0")]);
   await run("diff", ctx);
   assert.match(ui.notifications[0]!, /a\.txt/);
   assert.match(ui.notifications[0]!, /\+12\/-3/);
@@ -389,47 +385,38 @@ test("diff: shows the preview of what undo would restore", async () => {
 test("diff: reports when the last message changed no files", async () => {
   const { store, run } = setup();
   store.add(makeCheckpoint({ files: [] }));
-  const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  const { ctx, ui } = sessionCtx([makeEntry("u1", "user", "l0")]);
   await run("diff", ctx);
   assert.equal(ui.notifications[0], "The last message changed no files");
 });
 
 test("store: redo stack survives a reload from appended entries", async () => {
-  const fresh = new CheckpointStore({ appendEntry: () => {} } as never);
+  const fresh = new CheckpointStore({ appendEntry: () => {} });
   const entries = [
     {
       type: "custom",
-      id: "c1",
-      parentId: null,
-      timestamp: "t",
       customType: "pi-undo/checkpoint",
       data: makeCheckpoint({}),
     },
     {
       type: "custom",
-      id: "r1",
-      parentId: null,
-      timestamp: "t",
       customType: "pi-undo/revert",
       data: { revertedEntryIds: ["u1"] },
     },
   ];
-  fresh.load({ getEntries: () => entries as never });
+  fresh.load({ getEntries: () => entries });
   assert.equal(fresh.peekReverted()?.userEntryId, "u1");
 });
 
 test("store: corrupted checkpoint entries are ignored on load", async () => {
-  const fresh = new CheckpointStore({ appendEntry: () => {} } as never);
+  const fresh = new CheckpointStore({ appendEntry: () => {} });
   const entries = [
     {
       type: "custom",
-      id: "c1",
-      parentId: null,
-      timestamp: "t",
       customType: "pi-undo/checkpoint",
-      data: { userEntryId: "u1" }, 
+      data: { userEntryId: "u1" },
     },
   ];
-  fresh.load({ getEntries: () => entries as never });
+  fresh.load({ getEntries: () => entries });
   assert.equal(fresh.peekReverted(), undefined);
 });
