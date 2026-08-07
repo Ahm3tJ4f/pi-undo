@@ -5,8 +5,6 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
-
 import { ShadowGit, snapshotStoreRoot } from "../src/git.ts";
 import { loadPiUndoConfig } from "../src/config.ts";
 
@@ -54,7 +52,7 @@ async function newTempDir(prefix: string): Promise<string> {
 }
 
 async function newShadow(cwd: string): Promise<ShadowGit> {
-  const git = new ShadowGit(fakePi() as unknown as ExtensionAPI, cwd);
+  const git = new ShadowGit(fakePi(), cwd);
   await git.ensure();
   return git;
 }
@@ -454,6 +452,27 @@ test("nested git repos are excluded: edits inside them are not undoable", async 
   }
 });
 
+test("default junk dirs are not snapshotted", async () => {
+  const dir = await newTempDir("pi-undo-junk-");
+  try {
+    await writeFile(path.join(dir, "a.txt"), "one\n");
+    await mkdir(path.join(dir, "dist"));
+    await writeFile(path.join(dir, "dist", "bundle.js"), "x\n");
+
+    const git = await newShadow(dir);
+    const before = await tracked(git);
+
+    await writeFile(path.join(dir, "dist", "bundle.js"), "changed\n");
+    await writeFile(path.join(dir, "b.txt"), "two\n");
+    const after = await tracked(git);
+
+    assert.deepEqual(await git.changedFiles(before, after), ["b.txt"]);
+    assert.deepEqual(await git.dirtySince(after), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("project pi-undo.json extraExcludes are honored for trusted projects", async () => {
   const dir = await newTempDir("pi-undo-extra-");
   try {
@@ -466,7 +485,7 @@ test("project pi-undo.json extraExcludes are honored for trusted projects", asyn
       JSON.stringify({ extraExcludes: ["myjunk"] }),
     );
 
-    const git = new ShadowGit(fakePi() as unknown as ExtensionAPI, dir, undefined, loadPiUndoConfig(dir, true));
+    const git = new ShadowGit(fakePi(), dir, undefined, loadPiUndoConfig(dir, true));
     await git.ensure();
     const before = await tracked(git);
 
@@ -492,7 +511,7 @@ test("project pi-undo.json is ignored for untrusted projects", async () => {
       JSON.stringify({ extraExcludes: ["myjunk"] }),
     );
 
-    const git = new ShadowGit(fakePi() as unknown as ExtensionAPI, dir, undefined, loadPiUndoConfig(dir, false));
+    const git = new ShadowGit(fakePi(), dir, undefined, loadPiUndoConfig(dir, false));
     await git.ensure();
     const before = await tracked(git);
 
@@ -530,7 +549,7 @@ test("file cap skips snapshots with a warning", async () => {
     for (let i = 0; i < 6; i++) {
       await writeFile(path.join(dir, `f${i}.txt`), "x\n");
     }
-    const git = new ShadowGit(fakePi() as unknown as ExtensionAPI, dir, undefined, { extraExcludes: [], maxFiles: 5 });
+    const git = new ShadowGit(fakePi(), dir, undefined, { extraExcludes: [], maxFiles: 5 });
     await git.ensure();
     assert.equal(await git.track(), undefined);
   } finally {

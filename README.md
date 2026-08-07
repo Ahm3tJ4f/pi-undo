@@ -30,23 +30,21 @@ restart.
 - **Two snapshots per message.** Each user message gets a before and an
   after tree hash. Undo restores only the files that message changed.
 
-## Commands
+## What is not snapshotted
 
-| Command | What it does                                                                                                     |
-| ------- | ---------------------------------------------------------------------------------------------------------------- |
-| `/undo` | Aborts the agent, shows a diff preview, restores the files to before the last message, and puts the prompt back. |
-| `/redo` | Re-applies the most recently undone message. Survives restarts.                                                  |
-| `/diff` | Shows what `/undo` would restore.                                                                                |
+A built-in blacklist skips directories that are never worth undoing:
 
-## Install
+- **Dependencies and build output:** `node_modules`, `Pods`, `vendor`,
+  `dist`, `build`, `target`, `.next`, `coverage`, `.venv`, `venv`
+- **Tool caches and app data:** `Library`, `AppData`, `.cache`, `.gradle`,
+  `.android`, `.npm`, `.yarn`, `.rustup`, `.cargo`, `.nuget`, `.m2`,
+  `.pnpm-store`, `.idea`, `.terraform`
 
-```bash
-pi install npm:@ahm3tj4f/pi-undo
+These names are matched at any depth, so `some/project/node_modules` is
+skipped inside any folder, not just at the top level.
 
-# OR
-
-pi install git:github.com/ahm3tj4f/pi-undo
-```
+Nested git repositories are excluded from snapshots automatically (they
+are covered by their own repo).
 
 ## Configuration
 
@@ -68,3 +66,21 @@ Project values override global values.
 | -------- | ------------ |
 | `extraExcludes` | Additional directory names to skip, matched at any depth |
 | `maxFiles` | Snapshot size cap (default 100000). Over this, snapshots are skipped for that message with a one-time warning instead of making pi slow |
+
+## Commands
+
+| Command | What it does                                                                                                     |
+| ------- | ---------------------------------------------------------------------------------------------------------------- |
+| `/undo` | Aborts the agent, shows a diff preview, restores the files to before the last message, and puts the prompt back. |
+| `/redo` | Re-applies the most recently undone message. Survives restarts.                                                  |
+| `/diff` | Shows what `/undo` would restore.                                                                                |
+
+## Install
+
+```bash
+pi install npm:@ahm3tj4f/pi-undo
+
+# OR
+
+pi install git:github.com/ahm3tj4f/pi-undo
+```

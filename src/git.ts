@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto"
 import { existsSync } from "node:fs"
+import type { Dirent } from "node:fs"
 import { copyFile, lstat, mkdir, readFile, readdir, rm, stat as fsStat, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import path from "node:path"
@@ -18,6 +19,56 @@ const GC_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 const PI_EXCLUDE: string[] = [":(exclude).pi", ":(exclude,glob)**/.pi/**"]
 
+const MAX_LARGE_EXCLUDES = 1000
+const STAT_CONCURRENCY = 8
+const MAX_NESTED_SCAN = 5000
+
+// Matched at any depth in every project. These are regenerated or app-owned,
+// never worth snapshotting: dependencies, build output, tool caches.
+const DEFAULT_EXCLUDES: string[] = [
+  "node_modules",
+  "Pods",
+  "vendor",
+  "dist",
+  "build",
+  "target",
+  ".next",
+  "coverage",
+  ".venv",
+  "Library",
+  "AppData",
+  ".cache",
+  ".gradle",
+  ".android",
+  ".npm",
+  ".yarn",
+  ".rustup",
+  ".cargo",
+  ".nuget",
+  ".pods",
+  ".m2",
+  ".pnpm-store",
+  ".idea",
+  ".terraform",
+  ".svn",
+  ".hg",
+  ".local",
+  ".paseo",
+  ".opencode",
+  ".agent-browser",
+  ".dev-browser",
+  ".antigravity",
+  ".docker",
+  ".expo",
+  ".gem",
+  ".cocoapods",
+  ".nvm",
+  ".mozilla",
+  ".vscode",
+  "snap",
+  "flatpak",
+]
+
 interface GitResult {
   stdout: string
   stderr: string
@@ -32,7 +83,6 @@ interface StoreMeta {
   cwd: string
   updatedAt: number
   lastGcAt?: number
-  
   largeExcludes?: string[]
 }
 
@@ -41,13 +91,11 @@ export function snapshotStoreRoot(): string {
 }
 
 export interface RestoreResult {
-  
   skipped: string[]
 }
 
 export interface DiffStatResult {
   rows: NumstatRow[]
-  
   binaryCount: number
 }
 
@@ -86,12 +134,10 @@ export class ShadowGit implements SnapshotRepo {
     this.gitdir = path.join(snapshotStoreRoot(), key)
   }
 
-  
   setWarn(warn: (message: string) => void): void {
     this.warn = warn
   }
 
-  
   async ensure(): Promise<void> {
     if (this.initialized) return
     await mkdir(this.gitdir, { recursive: true })
@@ -106,7 +152,6 @@ export class ShadowGit implements SnapshotRepo {
         ["config", "core.longpaths", "true"],
         ["config", "core.symlinks", "true"],
         ["config", "core.fsmonitor", "false"],
-        
         ["config", "feature.manyFiles", "true"],
         ["config", "index.version", "4"],
         ["config", "index.threads", "true"],
@@ -121,7 +166,6 @@ export class ShadowGit implements SnapshotRepo {
     this.initialized = true
   }
 
-  
   async track(): Promise<string | undefined> {
     await this.ensure()
     if (!(await this.add())) return undefined
@@ -129,7 +173,6 @@ export class ShadowGit implements SnapshotRepo {
     return result.stdout.trim()
   }
 
-  
   async changedFiles(from: string, to: string): Promise<string[]> {
     await this.ensure()
     const result = await this.git(
@@ -140,11 +183,8 @@ export class ShadowGit implements SnapshotRepo {
     return unique(nulSplit(result.stdout).map(normalizeGitPath).filter((f): f is string => Boolean(f)))
   }
 
-  
   async dirtySince(snapshot: string): Promise<string[]> {
     await this.ensure()
-    
-    
     const meta = await this.readMeta()
     await this.syncExcludes(meta.largeExcludes ?? [])
     const [worktree, staged, untracked] = await Promise.all([
@@ -163,7 +203,6 @@ export class ShadowGit implements SnapshotRepo {
     )
   }
 
-  
   async restoreSnapshot(snapshot: string, files: string[]): Promise<RestoreResult> {
     await this.ensure()
     const rels = unique(files.map(normalizeGitPath).filter((f): f is string => Boolean(f)))
@@ -176,9 +215,6 @@ export class ShadowGit implements SnapshotRepo {
       else safe.push(rel)
     }
     if (blocked.length > 0) {
-      
-      
-      
       await this.dropPaths(blocked)
     }
     if (safe.length === 0) return { skipped: blocked }
@@ -187,25 +223,21 @@ export class ShadowGit implements SnapshotRepo {
     const missing = safe.filter((rel) => !inTree.has(rel))
     const present = safe.filter((rel) => inTree.has(rel))
 
-    
-    
     const deleted: string[] = []
     for (const rel of [...missing].sort((a, b) => b.length - a.length)) {
       try {
         await rm(path.join(this.cwd, rel), { recursive: true, force: true })
         deleted.push(rel)
       } catch {
-        
+        // Best effort: the file may already be gone.
       }
     }
     if (deleted.length > 0) await this.stagePaths(deleted)
 
-    
     await this.checkoutPaths(snapshot, [...present].sort((a, b) => a.length - b.length))
     return { skipped: blocked }
   }
 
-  
   private async hasSymlinkParent(rel: string): Promise<boolean> {
     let current = this.cwd
     const parts = rel.split("/")
@@ -216,14 +248,12 @@ export class ShadowGit implements SnapshotRepo {
       try {
         if ((await lstat(current)).isSymbolicLink()) return true
       } catch {
-        
         return false
       }
     }
     return false
   }
 
-  
   async verifySnapshot(snapshot: string, exclude: string[] = []): Promise<boolean> {
     await this.ensure()
     if (exclude.length === 0) {
@@ -242,7 +272,6 @@ export class ShadowGit implements SnapshotRepo {
       .every((file) => excluded.has(file))
   }
 
-  
   async diffNumstat(from: string, to: string): Promise<DiffStatResult> {
     await this.ensure()
     const result = await this.git(
@@ -252,8 +281,6 @@ export class ShadowGit implements SnapshotRepo {
     if (result.code !== 0) return { rows: [], binaryCount: 0 }
     const rows: NumstatRow[] = []
     let binaryCount = 0
-    
-    
     for (const record of result.stdout.split("\0").filter(Boolean)) {
       const fields = record.split("\t")
       const added = fields[0]
@@ -272,7 +299,6 @@ export class ShadowGit implements SnapshotRepo {
     return { rows, binaryCount }
   }
 
-  
   async gcIfDue(): Promise<void> {
     await this.ensure()
     const meta = await this.readMeta()
@@ -281,10 +307,6 @@ export class ShadowGit implements SnapshotRepo {
     if (result.code !== 0) return
     await this.writeMeta({ lastGcAt: Date.now() })
   }
-
-  
-  
-  
 
   private async git(args: string[], opts: GitOptions = {}): Promise<GitResult> {
     const result = await this.pi.exec(
@@ -298,7 +320,6 @@ export class ShadowGit implements SnapshotRepo {
     return { stdout: result.stdout, stderr: result.stderr, code: result.code }
   }
 
-  
   private async sourceGitDir(): Promise<string | null> {
     const result = await this.pi.exec("git", ["rev-parse", "--absolute-git-dir"], { cwd: this.cwd })
     if (result.code !== 0) return null
@@ -307,7 +328,6 @@ export class ShadowGit implements SnapshotRepo {
     return dir
   }
 
-  
   private async seed(): Promise<void> {
     const source = await this.sourceGitDir()
     if (!source) return
@@ -316,7 +336,6 @@ export class ShadowGit implements SnapshotRepo {
     if (!existsSync(sourceObjects)) return
     const alternates = [sourceObjects]
     try {
-      
       const chained = await readFile(path.join(sourceObjects, "info", "alternates"), "utf8")
       for (const line of chained.split("\n")) {
         const candidate = line.trim()
@@ -325,18 +344,16 @@ export class ShadowGit implements SnapshotRepo {
         }
       }
     } catch {
-      
+      // No chained alternates.
     }
     await mkdir(path.join(this.gitdir, "objects", "info"), { recursive: true })
     await writeFile(path.join(this.gitdir, "objects", "info", "alternates"), alternates.join("\n") + "\n")
 
-    
     if (await this.sourceHasSparseCheckout()) return
     const sourceIndex = path.join(source, "index")
     if (!existsSync(sourceIndex)) return
     try {
       await copyFile(sourceIndex, path.join(this.gitdir, "index"))
-      
       const check = await this.git(["ls-files"], { allowFailure: true })
       if (check.code !== 0) {
         await rm(path.join(this.gitdir, "index"), { force: true })
@@ -354,19 +371,23 @@ export class ShadowGit implements SnapshotRepo {
     return false
   }
 
-  
   private async add(): Promise<boolean> {
     const meta = await this.readMeta()
-    await this.syncExcludes(meta.largeExcludes ?? [])
+    const largeExcludes = this.prunedLargeExcludes(meta.largeExcludes ?? [])
+    await this.syncExcludes(largeExcludes)
     const [changed, untracked] = await Promise.all([
       this.git(["diff-files", "--name-only", "-z", "--", ".", ...PI_EXCLUDE], { allowFailure: true }),
       this.git(["ls-files", "--full-name", "--others", "--exclude-standard", "-z", "--", ".", ...PI_EXCLUDE], {
         allowFailure: true,
       }),
     ])
-    const all = unique([...nulSplit(changed.stdout), ...nulSplit(untracked.stdout)])
+    const changedList = nulSplit(changed.stdout)
       .map(normalizeGitPath)
       .filter((f): f is string => Boolean(f))
+    const untrackedList = nulSplit(untracked.stdout)
+      .map(normalizeGitPath)
+      .filter((f): f is string => Boolean(f))
+    const all = unique([...changedList, ...untrackedList])
     if (all.length === 0) return true
 
     const nested = new Set<string>()
@@ -376,16 +397,15 @@ export class ShadowGit implements SnapshotRepo {
     }
     if (nested.size > 0) {
       const list = [...nested].sort().join(", ")
-      
       if (this.warnedExcludes !== list) {
         this.warnedExcludes = list
         this.warn(`pi-undo: excluding ${nested.size} nested git repo(s) from snapshot: ${list}`)
       }
     } else if (this.warnedExcludes !== "") {
-      
       this.warnedExcludes = ""
     }
     const allowAll = all.filter((file) => !nested.has(file))
+    if (allowAll.length === 0) return true
 
     const maxFiles = this.config.maxFiles
     if (allowAll.length > maxFiles) {
@@ -398,37 +418,26 @@ export class ShadowGit implements SnapshotRepo {
       return false
     }
 
-    const ignored = await this.checkIgnored(allowAll)
+    // Untracked files are already filtered by --exclude-standard and git add
+    // skips ignored untracked paths, so only tracked changes can be newly
+    // ignored and need an explicit check-ignore pass.
+    const ignored = await this.checkIgnored(changedList)
     if (ignored.size > 0) await this.dropPaths([...ignored])
     const allow = allowAll.filter((file) => !ignored.has(file))
     if (allow.length === 0) return true
 
-    const untrackedSet = new Set(
-      nulSplit(untracked.stdout).map(normalizeGitPath).filter((f): f is string => Boolean(f)),
-    )
-    const large = new Set<string>()
-    for (const file of allow) {
-      if (!untrackedSet.has(file)) continue
-      try {
-        const info = await fsStat(path.join(this.cwd, file))
-        if (info.isFile() && info.size > MAX_UNTRACKED_SIZE) large.add(file)
-      } catch {
-        
-      }
-    }
-    if (large.size > 0) {
-      
-      
-      const largeList = unique([...(meta.largeExcludes ?? []), ...large])
-      await this.writeMeta({ largeExcludes: largeList })
-      await this.syncExcludes(largeList)
+    const untrackedSet = new Set(untrackedList)
+    const large = await this.findLargeFiles(allow.filter((file) => untrackedSet.has(file)))
+    if (large.size > 0 || largeExcludes.length !== (meta.largeExcludes ?? []).length) {
+      const next = unique([...largeExcludes, ...large]).slice(0, MAX_LARGE_EXCLUDES)
+      await this.writeMeta({ largeExcludes: next })
+      await this.syncExcludes(next)
     }
 
     await this.stagePaths(allow.filter((file) => !large.has(file)))
     return true
   }
 
-  
   private async checkIgnored(files: string[]): Promise<Set<string>> {
     const ignored = new Set<string>()
     for (let i = 0; i < files.length; i += BATCH) {
@@ -443,9 +452,7 @@ export class ShadowGit implements SnapshotRepo {
         ],
         { allowFailure: true },
       )
-      
-      
-      
+      // Exit 0 means at least one path is ignored, 1 means none are.
       if (result.code === 0 || result.code === 1) {
         for (const file of result.stdout.split("\n").filter(Boolean)) {
           ignored.add(file.startsWith("./:") ? file.slice(2) : file)
@@ -455,15 +462,10 @@ export class ShadowGit implements SnapshotRepo {
     return ignored
   }
 
-  
   private async stagePaths(files: string[]): Promise<void> {
     if (files.length === 0) return
     if (await this.tryPathspec(["add", "--all", "--sparse"], files)) return
 
-    
-    
-    
-    
     const failed: string[] = []
     for (const file of files) {
       if (!(await this.tryPathspec(["add", "--all", "--sparse"], [file]))) failed.push(file)
@@ -473,7 +475,6 @@ export class ShadowGit implements SnapshotRepo {
     }
   }
 
-  
   private async tryPathspec(command: string[], files: string[]): Promise<boolean> {
     if (files.length === 0) return true
     const specFile = path.join(
@@ -492,12 +493,13 @@ export class ShadowGit implements SnapshotRepo {
     }
   }
 
-  
   private async containsNestedRepo(rel: string): Promise<boolean> {
     const stack = [path.join(this.cwd, rel)]
+    let visited = 0
     while (stack.length > 0) {
+      if (++visited > MAX_NESTED_SCAN) return true
       const dir = stack.pop()!
-      let entries: import("node:fs").Dirent[]
+      let entries: Dirent[]
       try {
         entries = await readdir(dir, { withFileTypes: true })
       } catch {
@@ -511,12 +513,10 @@ export class ShadowGit implements SnapshotRepo {
     return false
   }
 
-  
   private async dropPaths(files: string[]): Promise<void> {
     await this.gitWithPathspec(["rm", "--cached", "-f", "--ignore-unmatch"], files)
   }
 
-  
   private async gitWithPathspec(command: string[], files: string[]): Promise<void> {
     if (files.length === 0) return
     const specFile = path.join(tmpdir(), `pi-undo-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.paths`)
@@ -534,7 +534,6 @@ export class ShadowGit implements SnapshotRepo {
     }
   }
 
-  
   private async listTree(tree: string, paths: string[]): Promise<Set<string>> {
     const found = new Set<string>()
     for (let i = 0; i < paths.length; i += BATCH) {
@@ -549,7 +548,6 @@ export class ShadowGit implements SnapshotRepo {
     return found
   }
 
-  
   private async checkoutPaths(tree: string, paths: string[]): Promise<void> {
     for (const group of this.chunkNonClashing(paths)) {
       const result = await this.git(
@@ -568,7 +566,6 @@ export class ShadowGit implements SnapshotRepo {
     }
   }
 
-  
   private chunkNonClashing(paths: string[]): string[][] {
     const groups: string[][] = []
     let current: string[] = []
@@ -583,8 +580,7 @@ export class ShadowGit implements SnapshotRepo {
     return groups
   }
 
-  
-  private async syncExcludes(extra: string[]): Promise<void> {
+  private async syncExcludes(extra: string[] = []): Promise<void> {
     const source = await this.sourceGitDir()
     let text = ""
     if (source) {
@@ -593,11 +589,47 @@ export class ShadowGit implements SnapshotRepo {
         text = (await readFile(excludePath, "utf8")).trimEnd()
       }
     }
-    const lines = [...(text ? text.split("\n") : [])]
+    const lines: string[] = text ? text.split("\n") : []
+    lines.push(...DEFAULT_EXCLUDES)
     for (const name of this.config.extraExcludes) lines.push(`/${name.replaceAll("\\", "/")}/`)
-    lines.push(...extra.map((file) => `/${file.replaceAll("\\", "/")}`))
+    for (const file of this.prunedLargeExcludes(extra)) {
+      lines.push(`/${file.replaceAll("\\", "/")}`)
+    }
     await mkdir(path.join(this.gitdir, "info"), { recursive: true })
     await writeFile(path.join(this.gitdir, "info", "exclude"), lines.join("\n") + "\n")
+  }
+
+  // Drop stale large-file excludes that live inside directories we no longer
+  // snapshot. Without this the exclude file grows without bound (and each
+  // pattern slows every tree walk).
+  private prunedLargeExcludes(list: string[]): string[] {
+    const defaultNames = new Set(DEFAULT_EXCLUDES)
+    const prefixes = this.config.extraExcludes
+    return list.filter((file) => {
+      const norm = file.replaceAll("\\", "/")
+      if (norm.split("/").some((part) => defaultNames.has(part))) return false
+      return !prefixes.some((prefix) => norm === prefix || norm.startsWith(`${prefix}/`))
+    })
+  }
+
+  private async findLargeFiles(files: string[]): Promise<Set<string>> {
+    const large = new Set<string>()
+    let next = 0
+    const worker = async () => {
+      while (true) {
+        const i = next++
+        const file = files[i]
+        if (file === undefined) return
+        try {
+          const info = await fsStat(path.join(this.cwd, file))
+          if (info.isFile() && info.size > MAX_UNTRACKED_SIZE) large.add(file)
+        } catch {
+          // Deleted between the walk and the stat; skip.
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(STAT_CONCURRENCY, files.length) }, worker))
+    return large
   }
 
   private metaFile(): string {

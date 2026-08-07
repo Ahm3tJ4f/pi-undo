@@ -13,7 +13,7 @@ export interface CaptureDeps {
   }): SnapshotRepo
 }
 
-export function setupCapture(pi: ExtensionAPI, store: CheckpointStore, deps: CaptureDeps): void {
+export function setupCapture(pi: Pick<ExtensionAPI, "on">, store: CheckpointStore, deps: CaptureDeps): void {
   let active: ActiveTurn | null = null
 
   pi.on("before_agent_start", async (event, ctx) => {
