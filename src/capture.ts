@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent"
+import type { ExtensionAPI, ExtensionContext, ExtensionUIContext, SessionEntry } from "@earendil-works/pi-coding-agent"
 import type { SnapshotRepo } from "./git.ts"
 import type { CheckpointStore } from "./store.ts"
 import type { ActiveTurn, UserMessageEntry } from "./types.ts"
@@ -6,7 +6,7 @@ import { isUserMessageEntry } from "./types.ts"
 import { errorMessage } from "./util.ts"
 
 export interface CaptureDeps {
-  getGit(ctx: { cwd: string }): SnapshotRepo
+  getGit(ctx: { cwd: string; ui: Pick<ExtensionUIContext, "notify"> }): SnapshotRepo
 }
 
 export function setupCapture(pi: ExtensionAPI, store: CheckpointStore, deps: CaptureDeps): void {

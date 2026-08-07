@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import { existsSync } from "node:fs"
-import { copyFile, lstat, mkdir, readFile, rm, stat as fsStat, writeFile } from "node:fs/promises"
+import { copyFile, lstat, mkdir, readFile, readdir, rm, stat as fsStat, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import path from "node:path"
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
@@ -66,12 +66,20 @@ export class ShadowGit implements SnapshotRepo {
   private readonly pi: ExtensionAPI
   private readonly gitdir: string
   private initialized = false
+  private warn: (message: string) => void
+  private warnedExcludes = ""
 
-  constructor(pi: ExtensionAPI, cwd: string) {
+  constructor(pi: ExtensionAPI, cwd: string, warn: (message: string) => void = () => {}) {
     this.pi = pi
     this.cwd = cwd
+    this.warn = warn
     const key = createHash("sha256").update(cwd).digest("hex").slice(0, 24)
     this.gitdir = path.join(snapshotStoreRoot(), key)
+  }
+
+  
+  setWarn(warn: (message: string) => void): void {
+    this.warn = warn
   }
 
   
@@ -352,9 +360,32 @@ export class ShadowGit implements SnapshotRepo {
       .filter((f): f is string => Boolean(f))
     if (all.length === 0) return
 
-    const ignored = await this.checkIgnored(all)
+    
+    
+    
+    
+    
+    const nested = new Set<string>()
+    for (const file of all) {
+      if (!file.endsWith("/")) continue
+      if (await this.containsNestedRepo(file)) nested.add(file)
+    }
+    if (nested.size > 0) {
+      const list = [...nested].sort().join(", ")
+      
+      if (this.warnedExcludes !== list) {
+        this.warnedExcludes = list
+        this.warn(`pi-undo: excluding ${nested.size} nested git repo(s) from snapshot: ${list}`)
+      }
+    } else if (this.warnedExcludes !== "") {
+      
+      this.warnedExcludes = ""
+    }
+    const allowAll = all.filter((file) => !nested.has(file))
+
+    const ignored = await this.checkIgnored(allowAll)
     if (ignored.size > 0) await this.dropPaths([...ignored])
-    const allow = all.filter((file) => !ignored.has(file))
+    const allow = allowAll.filter((file) => !ignored.has(file))
     if (allow.length === 0) return
 
     
@@ -412,7 +443,58 @@ export class ShadowGit implements SnapshotRepo {
 
   
   private async stagePaths(files: string[]): Promise<void> {
-    await this.gitWithPathspec(["add", "--all", "--sparse"], files)
+    if (files.length === 0) return
+    if (await this.tryPathspec(["add", "--all", "--sparse"], files)) return
+
+    
+    
+    
+    
+    const failed: string[] = []
+    for (const file of files) {
+      if (!(await this.tryPathspec(["add", "--all", "--sparse"], [file]))) failed.push(file)
+    }
+    if (failed.length > 0) {
+      this.warn(`pi-undo: could not stage ${failed.length} path(s) for snapshot: ${failed.join(", ")}`)
+    }
+  }
+
+  
+  private async tryPathspec(command: string[], files: string[]): Promise<boolean> {
+    if (files.length === 0) return true
+    const specFile = path.join(
+      tmpdir(),
+      `pi-undo-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.paths`,
+    )
+    await writeFile(specFile, files.map(literalPathspec).join("\0") + "\0")
+    try {
+      const result = await this.git(
+        [...command, `--pathspec-from-file=${specFile}`, "--pathspec-file-nul"],
+        { allowFailure: true },
+      )
+      return result.code === 0
+    } finally {
+      await rm(specFile, { force: true })
+    }
+  }
+
+  
+  private async containsNestedRepo(rel: string): Promise<boolean> {
+    const stack = [path.join(this.cwd, rel)]
+    while (stack.length > 0) {
+      const dir = stack.pop()!
+      let entries: import("node:fs").Dirent[]
+      try {
+        entries = await readdir(dir, { withFileTypes: true })
+      } catch {
+        continue
+      }
+      for (const entry of entries) {
+        if (entry.name === ".git") return true
+        if (entry.isDirectory()) stack.push(path.join(dir, entry.name))
+      }
+    }
+    return false
   }
 
   

@@ -394,6 +394,59 @@ test("gc runs on a seeded repo", async () => {
   }
 });
 
+async function makeNestedRepo(parent: string, name: string, file: string, content: string): Promise<void> {
+  const dir = path.join(parent, name);
+  await mkdir(dir, { recursive: true });
+  await exec("git", ["init", "--quiet", "-b", "main"], { cwd: dir });
+  await writeFile(path.join(dir, file), content);
+  await exec("git", ["config", "user.email", "t@example.com"], { cwd: dir });
+  await exec("git", ["config", "user.name", "test"], { cwd: dir });
+  await exec("git", ["add", "--all"], { cwd: dir });
+  await exec("git", ["commit", "--quiet", "-m", "init"], { cwd: dir });
+}
+
+test("nested git repos are excluded: edits inside them are not undoable", async () => {
+  const dir = await newTempDir("pi-undo-nested-");
+  try {
+    
+    await writeFile(path.join(dir, "root.txt"), "one\n");
+    await exec("git", ["init", "--quiet"], { cwd: dir });
+    await exec("git", ["config", "user.email", "t@example.com"], { cwd: dir });
+    await exec("git", ["config", "user.name", "test"], { cwd: dir });
+    await exec("git", ["add", "--all"], { cwd: dir });
+    await exec("git", ["commit", "--quiet", "-m", "init"], { cwd: dir });
+
+    
+    await makeNestedRepo(dir, "nested", "g.txt", "old\n");
+    
+    const empty = path.join(dir, "empty");
+    await mkdir(empty, { recursive: true });
+    await exec("git", ["init", "--quiet", "-b", "main"], { cwd: empty });
+    await writeFile(path.join(empty, "f.txt"), "old\n");
+
+    const git = await newShadow(dir);
+    const before = await git.track();
+
+    
+    await writeFile(path.join(dir, "root.txt"), "edited\n");
+    await writeFile(path.join(dir, "nested", "g.txt"), "edited\n");
+    await writeFile(path.join(empty, "f.txt"), "edited\n");
+    const after = await git.track();
+
+    
+    assert.deepEqual(await git.changedFiles(before, after), ["root.txt"]);
+
+    
+    await git.restoreSnapshot(before, ["root.txt"]);
+    assert.equal(await readFile(path.join(dir, "root.txt"), "utf8"), "one\n");
+    assert.equal(await readFile(path.join(dir, "nested", "g.txt"), "utf8"), "edited\n");
+    assert.equal(await readFile(path.join(empty, "f.txt"), "utf8"), "edited\n");
+    assert.equal(await git.verifySnapshot(before), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 async function findShadowGitDir(cwd: string): Promise<string> {
   const storeRoot = snapshotStoreRoot();
   const { readdir } = await import("node:fs/promises");

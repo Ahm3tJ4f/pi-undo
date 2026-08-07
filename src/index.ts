@@ -11,7 +11,9 @@ export default function (pi: ExtensionAPI): void {
 
   const deps: CaptureDeps = {
     getGit(ctx) {
-      if (!git || git.cwd !== ctx.cwd) git = new ShadowGit(pi, ctx.cwd)
+      const notify = (message: string) => ctx.ui.notify(message, "warning")
+      if (!git || git.cwd !== ctx.cwd) git = new ShadowGit(pi, ctx.cwd, notify)
+      else git.setWarn(notify)
       return git
     },
   }
