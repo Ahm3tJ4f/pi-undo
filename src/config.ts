@@ -11,8 +11,9 @@ export const DEFAULT_MAX_FILES = 100_000
 
 // Matched at any depth in every project. These are regenerated or app-owned,
 // never worth snapshotting: dependencies, build output, tool caches. Entries
-// are gitignore-style patterns: plain names match the directory at any depth,
-// and globs are supported (for example "**/build-*" or "*.tmp").
+// are full gitignore glob patterns: plain names match at any depth, globs are
+// supported (for example "**/build-*" or "*.tmp"), and a trailing slash
+// means the pattern matches directories only, as in gitignore.
 export const DEFAULT_EXCLUDE_DIRECTORIES: string[] = [
   "node_modules",
   "Pods",

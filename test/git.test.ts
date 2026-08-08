@@ -229,6 +229,31 @@ test("glob patterns in excludeDirectories are honored everywhere", async () => {
   }
 });
 
+test("file globs in excludeDirectories exclude files, not only directories", async () => {
+  const dir = await newTempDir("pi-undo-fileglob-excl-");
+  try {
+    await writeFile(path.join(dir, "a.txt"), "one\n");
+    await mkdir(path.join(dir, "sub"), { recursive: true });
+    await writeFile(path.join(dir, "sub", "note.tmp"), "one\n");
+
+    const git = new ShadowGit(fakePi(), dir, undefined, {
+      excludeDirectories: ["*.tmp"],
+      maxFiles: 5,
+    });
+    await git.ensure();
+    const before = await tracked(git);
+
+    await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
+    await writeFile(path.join(dir, "sub", "new.tmp"), "two\n");
+    const after = await tracked(git);
+
+    assert.deepEqual(await git.changedFiles(before, after), ["a.txt"]);
+    assert.deepEqual(await git.dirtySince(after), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("excludeDirectories entries with a trailing slash still match", async () => {
   const dir = await newTempDir("pi-undo-slash-excl-");
   try {

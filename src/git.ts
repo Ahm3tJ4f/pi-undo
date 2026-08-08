@@ -19,14 +19,6 @@ const GC_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 const PI_EXCLUDE: string[] = [":(exclude).pi", ":(exclude,glob)**/.pi/**"]
 
-// Normalizes an excludeDirectories entry for both the gitignore pattern and
-// path matching: forward slashes, no trailing slash. gitignore strips exactly
-// one trailing slash, so an entry like "node_modules/" must become
-// "node_modules/" in the pattern, never "node_modules//".
-function normalizeExcludeName(name: string): string {
-  return name.replaceAll("\\", "/").replace(/\/+$/, "")
-}
-
 const MAX_LARGE_EXCLUDES = 1000
 const STAT_CONCURRENCY = 8
 const MAX_NESTED_SCAN = 5000
@@ -373,7 +365,7 @@ export class ShadowGit implements SnapshotRepo {
 
   private async add(): Promise<boolean> {
     const meta = await this.readMeta()
-    const largeExcludes = this.prunedLargeExcludes(meta.largeExcludes ?? [])
+    const largeExcludes = meta.largeExcludes ?? []
     await this.syncExcludes(largeExcludes)
     const [changed, untracked] = await Promise.all([
       this.git(["diff-files", "--name-only", "-z", "--", ".", ...PI_EXCLUDE], { allowFailure: true }),
@@ -433,7 +425,7 @@ export class ShadowGit implements SnapshotRepo {
 
     const untrackedSet = new Set(untrackedList)
     const large = await this.findLargeFiles(allow.filter((file) => untrackedSet.has(file)))
-    if (large.size > 0 || largeExcludes.length !== (meta.largeExcludes ?? []).length) {
+    if (large.size > 0) {
       const next = unique([...largeExcludes, ...large]).slice(0, MAX_LARGE_EXCLUDES)
       await this.writeMeta({ largeExcludes: next })
       await this.syncExcludes(next)
@@ -595,38 +587,29 @@ export class ShadowGit implements SnapshotRepo {
       }
     }
     const lines: string[] = text ? text.split("\n") : []
-    // No leading slash: these must match the directory at any depth, not only
-    // at the snapshot root. A home-directory snapshot contains projects in
-    // subdirectories (github/<repo>/node_modules/...), and a root-anchored
-    // /node_modules/ would let every one of those nested copies into the
-    // snapshot.
-    // Trailing slashes are stripped first: git silently never matches "dir//"
-    // (gitignore only strips one trailing slash), so an entry that already
-    // ends with "/" must not get a second one appended.
+    // Entries are written as-is: full gitignore glob syntax, no leading slash
+    // (so plain names match at any depth) and no forced trailing slash (so
+    // "node_modules/" keeps its gitignore meaning of directories only, and
+    // never becomes the unmatched "node_modules//"). A home-directory
+    // snapshot contains projects in subdirectories
+    // (github/<repo>/node_modules/...), so a root-anchored /node_modules/
+    // would let every one of those nested copies into the snapshot.
     for (const name of this.config.excludeDirectories) {
-      lines.push(`${normalizeExcludeName(name)}/`)
-    }
-    for (const file of this.prunedLargeExcludes(extra)) {
-      lines.push(`/${file.replaceAll("\\", "/")}`)
+      lines.push(name.replaceAll("\\", "/"))
     }
     await mkdir(path.join(this.gitdir, "info"), { recursive: true })
     await writeFile(path.join(this.gitdir, "info", "exclude"), lines.join("\n") + "\n")
-  }
-
-  // Drop stale large-file excludes that live inside directories we no longer
-  // snapshot. Without this the exclude file grows without bound (and each
-  // pattern slows every tree walk). Only exact-name entries are pruned:
-  // entries covered by a glob pattern are left in place, which is harmless
-  // (they point at files the glob already excludes, and those files are never
-  // re-detected because the untracked listing honors the glob).
-  private prunedLargeExcludes(list: string[]): string[] {
-    const names = this.config.excludeDirectories.map(normalizeExcludeName)
-    const excludeNames = new Set(names)
-    return list.filter((file) => {
-      const norm = file.replaceAll("\\", "/")
-      if (norm.split("/").some((part) => excludeNames.has(part))) return false
-      return !names.some((prefix) => norm === prefix || norm.startsWith(`${prefix}/`))
-    })
+    if (extra.length === 0) return
+    // Keep only the large-file excludes that no current pattern covers.
+    // Entries already ignored by the config or by the project's own ignore
+    // rules are redundant, and without this cleanup the exclude file grows
+    // without bound (each pattern slows every tree walk). Delegating to git's
+    // own matcher means glob patterns in excludeDirectories are honored.
+    const ignored = await this.checkIgnored(extra)
+    for (const file of extra) {
+      if (!ignored.has(file)) lines.push(`/${file.replaceAll("\\", "/")}`)
+    }
+    await writeFile(path.join(this.gitdir, "info", "exclude"), lines.join("\n") + "\n")
   }
 
   // Removes from the index any tracked file that the standard exclusions

@@ -34,9 +34,9 @@ restart.
 
 pi-undo reads one config file: `~/.pi/agent/pi-undo.json`. On the first run
 the file is created with the default values, and you edit it directly to
-change them. Add or remove names in `excludeDirectories`, or change
+change them. Add or remove patterns in `excludeDirectories`, or change
 `maxFiles`. The list in the file is the complete list: removing an entry
-really un-excludes that directory.
+really un-excludes that path.
 
 ```json
 {
@@ -47,7 +47,7 @@ really un-excludes that directory.
 
 | Field | What it does |
 | -------- | ------------ |
-| `excludeDirectories` | Directory names never snapshotted, matched at any depth |
+| `excludeDirectories` | Full gitignore glob patterns, never snapshotted. Plain names match at any depth; globs like `**/build-*` or `*.tmp` work; a trailing slash means directories only |
 | `maxFiles` | Snapshot size cap (default 100000). Over this, snapshots are skipped for that message with a one-time warning instead of making pi slow |
 
 ## Commands
