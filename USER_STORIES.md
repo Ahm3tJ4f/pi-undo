@@ -56,20 +56,21 @@ Severity: **core** = must always work, **edge** = rare but should not break badl
 
 ## 3. Conflicts with manual edits
 
-- US-23 (core) User edits a file by hand after the message, then `/undo`: the
-  dirty check detects it, shows the "Manual edits found" dialog, and asks
-  before restoring.
+- US-23 (core) User edits a file by hand after the message, then `/undo`: if
+  that file is one the message changed, the dirty check detects it, shows the
+  "Manual edits found" dialog, and asks before restoring.
 - US-24 (core) Dialog answered "No": undo is blocked and the working tree is
   left untouched.
 - US-25 (core) Dialog answered "Yes": undo restores and the manual edits to
   the restored files are lost.
-- US-26 (edge) Manual edits exist in files the undo will NOT touch: the dialog
-  still lists them today (conservative). It over-warns, because those edits
-  survive the undo. Consider narrowing the list to checkpoint files.
+- US-26 (core) Manual edits exist in files the undo will NOT touch: they are
+  never listed in the dialog and never block undo. Those edits survive the
+  undo untouched.
 - US-27 (core) Nested git repos near the worktree: they are never reported as
   manual edits (fixed), so `/undo` in `~/` does not show false dialogs.
-- US-28 (edge) `/redo` with manual edits: redo is blocked with a warning (no
-  confirmation dialog, unlike undo).
+- US-28 (edge) `/redo` with manual edits in files the message changed: redo is
+  blocked with a warning (no confirmation dialog, unlike undo). Manual edits
+  in other files do not block redo.
 - US-29 (edge) Dirty check passes but the user edits files between the check
   and the restore: the post-restore verification fails and pi-undo rolls the
   files back to the after-state.
@@ -153,8 +154,6 @@ Severity: **core** = must always work, **edge** = rare but should not break badl
 
 ## Open questions
 
-- OQ-1 Should the manual-edits dialog only list files the undo will actually
-  restore (checkpoint files)? Today it lists every dirty path.
 - OQ-2 Should pi-undo guard against FIFO/special files during `git add`?
 - OQ-3 Should resuming a session in a different directory warn that old undo
   checkpoints are unusable?
