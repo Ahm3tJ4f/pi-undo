@@ -19,6 +19,14 @@ const GC_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 const PI_EXCLUDE: string[] = [":(exclude).pi", ":(exclude,glob)**/.pi/**"]
 
+// Normalizes an excludeDirectories entry for both the gitignore pattern and
+// path matching: forward slashes, no trailing slash. gitignore strips exactly
+// one trailing slash, so an entry like "node_modules/" must become
+// "node_modules/" in the pattern, never "node_modules//".
+function normalizeExcludeName(name: string): string {
+  return name.replaceAll("\\", "/").replace(/\/+$/, "")
+}
+
 const MAX_LARGE_EXCLUDES = 1000
 const STAT_CONCURRENCY = 8
 const MAX_NESTED_SCAN = 5000
@@ -46,6 +54,7 @@ export function snapshotStoreRoot(): string {
 
 export interface RestoreResult {
   skipped: string[]
+  excluded: string[]
 }
 
 export interface DiffStatResult {
@@ -159,24 +168,47 @@ export class ShadowGit implements SnapshotRepo {
     const untrackedFiles = nulSplit(untracked.stdout)
       .map(normalizeGitPath)
       .filter((f): f is string => f !== undefined && !f.endsWith("/"))
-    return unique([...tracked, ...untrackedFiles])
+    const merged = unique([...tracked, ...untrackedFiles])
+    if (merged.length === 0) return []
+    // Files matched by an exclude rule (our patterns, including globs, or the
+    // project's own .gitignore) are never part of any snapshot, so they are
+    // never restored and must never block undo. This also covers tracked
+    // files still present in the index from before directory exclusions
+    // worked at every depth.
+    const ignored = await this.checkIgnored(merged)
+    return merged.filter((file) => !ignored.has(file))
   }
 
   async restoreSnapshot(snapshot: string, files: string[]): Promise<RestoreResult> {
     await this.ensure()
+    // Make sure info/exclude reflects the current config and large-file
+    // excludes before the ignore checks below: callers do not always go
+    // through track() or dirtySince first.
+    const meta = await this.readMeta()
+    await this.syncExcludes(meta.largeExcludes ?? [])
     const rels = unique(files.map(normalizeGitPath).filter((f): f is string => Boolean(f)))
-    if (rels.length === 0) return { skipped: [] }
+    if (rels.length === 0) return { skipped: [], excluded: [] }
 
     const blocked: string[] = []
+    const excluded: string[] = []
     const safe: string[] = []
+    // Files that match a current exclude rule are not part of any new
+    // snapshot, so restoring them from an old tree would clobber manual edits
+    // that dirtySince explicitly promised not to touch (the transition window
+    // after an exclude rule appears). Skip them like symlink-blocked files.
+    const nowExcluded = await this.checkIgnored(rels)
     for (const rel of rels) {
       if (await this.hasSymlinkParent(rel)) blocked.push(rel)
+      else if (nowExcluded.has(rel)) excluded.push(rel)
       else safe.push(rel)
     }
     if (blocked.length > 0) {
       await this.dropPaths(blocked)
     }
-    if (safe.length === 0) return { skipped: blocked }
+    if (excluded.length > 0) {
+      await this.dropPaths(excluded)
+    }
+    if (safe.length === 0) return { skipped: blocked, excluded }
 
     // Never delete files based on a tree this store does not have (for
     // example a session resumed in a different directory). ls-tree on a
@@ -203,7 +235,7 @@ export class ShadowGit implements SnapshotRepo {
     if (deleted.length > 0) await this.stagePaths(deleted)
 
     await this.checkoutPaths(snapshot, [...present].sort((a, b) => a.length - b.length))
-    return { skipped: blocked }
+    return { skipped: blocked, excluded }
   }
 
   private async hasSymlinkParent(rel: string): Promise<boolean> {
@@ -356,6 +388,11 @@ export class ShadowGit implements SnapshotRepo {
       .map(normalizeGitPath)
       .filter((f): f is string => Boolean(f))
     const all = unique([...changedList, ...untrackedList])
+    // Files tracked before an exclude directory was configured (or before
+    // this cleanup existed) stay in the index forever, bloat every snapshot
+    // and surface as false manual edits. Drop them so snapshots only ever
+    // contain files pi-undo is allowed to track.
+    await this.dropTrackedUnderExcludedDirs()
     if (all.length === 0) return true
 
     const nested = new Set<string>()
@@ -558,7 +595,17 @@ export class ShadowGit implements SnapshotRepo {
       }
     }
     const lines: string[] = text ? text.split("\n") : []
-    for (const name of this.config.excludeDirectories) lines.push(`/${name.replaceAll("\\", "/")}/`)
+    // No leading slash: these must match the directory at any depth, not only
+    // at the snapshot root. A home-directory snapshot contains projects in
+    // subdirectories (github/<repo>/node_modules/...), and a root-anchored
+    // /node_modules/ would let every one of those nested copies into the
+    // snapshot.
+    // Trailing slashes are stripped first: git silently never matches "dir//"
+    // (gitignore only strips one trailing slash), so an entry that already
+    // ends with "/" must not get a second one appended.
+    for (const name of this.config.excludeDirectories) {
+      lines.push(`${normalizeExcludeName(name)}/`)
+    }
     for (const file of this.prunedLargeExcludes(extra)) {
       lines.push(`/${file.replaceAll("\\", "/")}`)
     }
@@ -568,15 +615,37 @@ export class ShadowGit implements SnapshotRepo {
 
   // Drop stale large-file excludes that live inside directories we no longer
   // snapshot. Without this the exclude file grows without bound (and each
-  // pattern slows every tree walk).
+  // pattern slows every tree walk). Only exact-name entries are pruned:
+  // entries covered by a glob pattern are left in place, which is harmless
+  // (they point at files the glob already excludes, and those files are never
+  // re-detected because the untracked listing honors the glob).
   private prunedLargeExcludes(list: string[]): string[] {
-    const excludeNames = new Set(this.config.excludeDirectories)
-    const prefixes = this.config.excludeDirectories
+    const names = this.config.excludeDirectories.map(normalizeExcludeName)
+    const excludeNames = new Set(names)
     return list.filter((file) => {
       const norm = file.replaceAll("\\", "/")
       if (norm.split("/").some((part) => excludeNames.has(part))) return false
-      return !prefixes.some((prefix) => norm === prefix || norm.startsWith(`${prefix}/`))
+      return !names.some((prefix) => norm === prefix || norm.startsWith(`${prefix}/`))
     })
+  }
+
+  // Removes from the index any tracked file that the standard exclusions
+  // consider ignored. Such files were staged before directory exclusions
+  // worked at every depth (root-anchored patterns) or came from a seeded
+  // source index; once tracked they never honor info/exclude and would be
+  // snapshotted and reported as manual edits forever. Delegating to git's own
+  // matcher (ls-files -i) means glob patterns in excludeDirectories are
+  // honored for free.
+  private async dropTrackedUnderExcludedDirs(): Promise<void> {
+    const result = await this.git(["ls-files", "-c", "-i", "--exclude-standard", "--full-name", "-z"], {
+      allowFailure: true,
+    })
+    if (result.code !== 0) return
+    const stale = nulSplit(result.stdout)
+      .map(normalizeGitPath)
+      .filter((f): f is string => Boolean(f))
+    if (stale.length === 0) return
+    await this.dropPaths(stale)
   }
 
   private async findLargeFiles(files: string[]): Promise<Set<string>> {

@@ -152,8 +152,167 @@ test("untracked files over the size cap are excluded from snapshots", async () =
     const after = await tracked(git);
 
     assert.deepEqual(await git.changedFiles(before, after), []);
-    
+    // Even though the big file is untracked, it must not show up as a manual
+    // edit: it is excluded via the exact-path large-file rule.
     assert.deepEqual(await git.dirtySince(after), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("excludeDirectories match at any depth, not only the snapshot root", async () => {
+  const dir = await newTempDir("pi-undo-nested-excl-");
+  try {
+    await writeFile(path.join(dir, "a.txt"), "one\n");
+    await mkdir(path.join(dir, "sub", "node_modules"), { recursive: true });
+    await writeFile(path.join(dir, "sub", "node_modules", "x.js"), "one\n");
+    const big = Buffer.alloc(2 * 1024 * 1024 + 1, 0x61);
+    await writeFile(path.join(dir, "sub", "node_modules", "big.bin"), big);
+
+    const git = await newShadow(dir);
+    const before = await tracked(git);
+
+    await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
+    await writeFile(path.join(dir, "sub", "node_modules", "y.js"), "two\n");
+    const after = await tracked(git);
+
+    assert.deepEqual(await git.changedFiles(before, after), ["a.txt"]);
+    assert.deepEqual(await git.dirtySince(after), []);
+    // The nested files must not be part of any snapshot.
+    const files = await exec(
+      "git",
+      ["--git-dir", await findShadowGitDir(dir), "ls-files"],
+      { cwd: dir },
+    );
+    assert.ok(
+      !files.stdout.includes("node_modules"),
+      "node_modules files leaked into the index",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("glob patterns in excludeDirectories are honored everywhere", async () => {
+  const dir = await newTempDir("pi-undo-glob-excl-");
+  try {
+    await writeFile(path.join(dir, "a.txt"), "one\n");
+    await mkdir(path.join(dir, "sub", "build-1"), { recursive: true });
+    await writeFile(path.join(dir, "sub", "build-1", "out.js"), "one\n");
+
+    const config = { excludeDirectories: ["**/build-*"], maxFiles: 5 };
+
+    // 1) Untracked files under a glob dir are not snapshotted and not dirty.
+    const git = new ShadowGit(fakePi(), dir, undefined, config);
+    await git.ensure();
+    const before = await tracked(git);
+    await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
+    await writeFile(path.join(dir, "sub", "build-1", "new.js"), "two\n");
+    const after = await tracked(git);
+    assert.deepEqual(await git.changedFiles(before, after), ["a.txt"]);
+    assert.deepEqual(await git.dirtySince(after), []);
+
+    // 2) A stale tracked file under a glob dir is dropped on the next track.
+    // Stage it by hand (as if tracked before globs existed), then track.
+    const gitDir = await findShadowGitDir(dir);
+    await exec("git", ["--git-dir", gitDir, "--work-tree", dir, "add", "sub/build-1/out.js"], {
+      cwd: dir,
+    });
+    await writeFile(path.join(dir, "sub", "build-1", "out.js"), "changed\n");
+    const afterDrop = await tracked(git);
+    const files = await exec("git", ["--git-dir", gitDir, "ls-files"], { cwd: dir });
+    assert.ok(!files.stdout.includes("build-1"), "glob-covered file stayed in the index");
+    assert.deepEqual(await git.changedFiles(before, afterDrop), ["a.txt"]);
+    assert.deepEqual(await git.dirtySince(afterDrop), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("excludeDirectories entries with a trailing slash still match", async () => {
+  const dir = await newTempDir("pi-undo-slash-excl-");
+  try {
+    await writeFile(path.join(dir, "a.txt"), "one\n");
+    await mkdir(path.join(dir, "sub", "node_modules"), { recursive: true });
+    await writeFile(path.join(dir, "sub", "node_modules", "x.js"), "one\n");
+
+    // The user wrote the entry with a trailing slash in pi-undo.json. The
+    // pattern must not become "node_modules//", which git never matches.
+    const git = new ShadowGit(fakePi(), dir, undefined, {
+      excludeDirectories: ["node_modules/"],
+      maxFiles: 5,
+    });
+    await git.ensure();
+    const before = await tracked(git);
+
+    await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
+    const after = await tracked(git);
+
+    assert.deepEqual(await git.changedFiles(before, after), ["a.txt"]);
+    assert.deepEqual(await git.dirtySince(after), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("stale tracked files under excluded dirs are dropped from the index", async () => {
+  const dir = await newTempDir("pi-undo-stale-excl-");
+  try {
+    await mkdir(path.join(dir, "node_modules"), { recursive: true });
+    await writeFile(path.join(dir, "node_modules", "x.js"), "one\n");
+    await writeFile(path.join(dir, "a.txt"), "one\n");
+
+    // First snapshot with no excludes: the file gets tracked, like it did
+    // before nested excludeDirectories worked.
+    const lax = new ShadowGit(fakePi(), dir, undefined, {
+      excludeDirectories: [],
+      maxFiles: 5,
+    });
+    await lax.ensure();
+    await lax.track();
+
+    // Now snapshot with the default excludes: the stale tracked file must be
+    // dropped and never appear in diffs or dirty checks.
+    const git = await newShadow(dir);
+    const before = await tracked(git);
+    await writeFile(path.join(dir, "node_modules", "x.js"), "changed\n");
+    const after = await tracked(git);
+
+    assert.deepEqual(await git.changedFiles(before, after), []);
+    assert.deepEqual(await git.dirtySince(after), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("restore skips files that became excluded and keeps manual edits", async () => {
+  const dir = await newTempDir("pi-undo-restore-excl-");
+  try {
+    await writeFile(path.join(dir, "a.txt"), "one\n");
+    await writeFile(path.join(dir, "out.log"), "old\n");
+    const git = await newShadow(dir);
+    const before = await tracked(git);
+
+    await writeFile(path.join(dir, "a.txt"), "one\ntwo\n");
+    await writeFile(path.join(dir, "out.log"), "new\n");
+    const after = await tracked(git);
+    const files = await git.changedFiles(before, after);
+    assert.deepEqual(files.sort(), ["a.txt", "out.log"]);
+
+    // The project now ignores *.log, and the user edits the file by hand.
+    await writeFile(path.join(dir, ".gitignore"), "*.log\n");
+    await writeFile(path.join(dir, "out.log"), "manual edit\n");
+
+    const result = await git.restoreSnapshot(before, files);
+    assert.deepEqual(result.excluded.sort(), ["out.log"]);
+    // The manual edit survives, the rest is restored.
+    assert.equal(await readFile(path.join(dir, "out.log"), "utf8"), "manual edit\n");
+    assert.equal(await readFile(path.join(dir, "a.txt"), "utf8"), "one\n");
+    // Verification passes when both skipped sets are honored, as restoreFiles does.
+    assert.equal(
+      await git.verifySnapshot(before, [...result.skipped, ...result.excluded]),
+      true,
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
