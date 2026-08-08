@@ -88,7 +88,7 @@ function makeRepo(): {
     },
     async restoreSnapshot(_snapshot, files) {
       state.calls.push(`restore:${_snapshot}:${files.join(",")}`);
-      return { skipped: [] };
+      return { skipped: [], excluded: [] };
     },
     async verifySnapshot(snapshot) {
       state.calls.push(`verify:${snapshot}`);
@@ -199,9 +199,11 @@ test("undo: dirty guard blocks when manual edits exist and user declines", async
   await run("undo", ctx);
   assert.equal(
     ui.notifications[0],
-    "Undo blocked: working tree has manual edits",
+    "Undo blocked: working tree has manual edits in files changed by the message",
   );
   assert.equal(ui.confirmCalls.length, 1);
+  assert.match(ui.confirmCalls[0]!.message, /a\.txt/);
+  assert.doesNotMatch(ui.confirmCalls[0]!.message, /b\.txt/);
   assert.deepEqual(navigations, []);
   assert.deepEqual(repoState.state.calls, ["dirtySince"]);
 });
@@ -220,6 +222,37 @@ test("undo: dirty guard shows the preview and restores after force", async () =>
   assert.ok(repoState.state.calls.includes("diffNumstat"));
   
   assert.match(ui.confirmCalls[1]!.message, /Total:/);
+});
+
+test("undo: manual edits in files the message did not change do not block", async () => {
+  const { store, repoState, run } = setup();
+  store.add(makeCheckpoint({}));
+  repoState.state.dirty = ["b.txt"];
+  const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  await run("undo", ctx);
+  // Only the diff preview confirm runs. No manual-edit dialog.
+  assert.equal(ui.confirmCalls.length, 1);
+  assert.match(ui.confirmCalls[0]!.message, /Restore files to the state before/);
+  assert.deepEqual(navigations, [{ target: "l0" }]);
+  assert.equal(ui.editorText, "fix the bug");
+  assert.ok(repoState.state.calls.includes("restore:before1:a.txt"));
+});
+
+test("undo: confirm restores all message files when only some have manual edits", async () => {
+  const { store, repoState, run } = setup();
+  store.add(makeCheckpoint({ files: ["a.txt", "c.txt"] }));
+  repoState.state.dirty = ["a.txt", "b.txt"];
+  const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  await run("undo", ctx);
+  // The manual-edit dialog lists only the overlapping file, not the dirty
+  // file outside the message and not the untouched message file.
+  assert.match(ui.confirmCalls[0]!.message, /a\.txt/);
+  assert.doesNotMatch(ui.confirmCalls[0]!.message, /b\.txt/);
+  assert.doesNotMatch(ui.confirmCalls[0]!.message, /c\.txt/);
+  // Restore still targets ALL message files.
+  assert.ok(repoState.state.calls.includes("restore:before1:a.txt,c.txt"));
+  assert.ok(repoState.state.calls.includes("verify:before1"));
+  assert.deepEqual(navigations, [{ target: "l0" }]);
 });
 
 test("undo: cancel before restore leaves everything untouched", async () => {
@@ -368,8 +401,23 @@ test("redo: blocked by the dirty guard", async () => {
   const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
   await run("redo", ctx);
   assert.match(ui.notifications[0]!, /blocked/);
+  assert.match(ui.notifications[0]!, /a\.txt/);
   assert.deepEqual(navigations, []);
   assert.equal(store.peekReverted()?.userEntryId, "u1", "still reverted");
+});
+
+test("redo: manual edits in files the message did not change do not block", async () => {
+  const { store, repoState, run } = setup();
+  store.add(makeCheckpoint({}));
+  store.markReverted(store.get("u1")!);
+  repoState.state.dirty = ["b.txt"];
+  const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  await run("redo", ctx);
+  assert.deepEqual(navigations, [{ target: "l3" }]);
+  assert.ok(repoState.state.calls.includes("restore:after1:a.txt"));
+  assert.ok(repoState.state.calls.includes("verify:after1"));
+  assert.equal(ui.editorText, "");
+  assert.equal(store.peekReverted(), undefined, "redo stack is popped");
 });
 
 test("diff: shows the preview of what undo would restore", async () => {

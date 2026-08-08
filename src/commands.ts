@@ -9,10 +9,10 @@ async function restoreFiles(
   git: SnapshotRepo,
   target: string,
   files: string[],
-): Promise<{ ok: boolean; skipped: string[] }> {
-  const { skipped } = await git.restoreSnapshot(target, files)
-  const ok = await git.verifySnapshot(target, skipped)
-  return { ok, skipped }
+): Promise<{ ok: boolean; skipped: string[]; excluded: string[] }> {
+  const { skipped, excluded } = await git.restoreSnapshot(target, files)
+  const ok = await git.verifySnapshot(target, [...skipped, ...excluded])
+  return { ok, skipped, excluded }
 }
 
 async function rollbackFiles(git: SnapshotRepo, snapshot: string, files: string[]): Promise<boolean> {
@@ -82,24 +82,30 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
 
   const changes = snapshotChanges(checkpoint)
   let skipped: string[] = []
+  let excluded: string[] = []
   try {
     if (changes) {
-      
       const git = deps.getGit(ctx)
       const dirty = await git.dirtySince(changes.after)
-      if (dirty.length > 0) {
-        const list = dirty.slice(0, 10).join("\n") + (dirty.length > 10 ? `\n... and ${dirty.length - 10} more` : "")
+      // Only files the message changed can be clobbered by the restore.
+      // Manual edits in other files survive the undo, so they must not
+      // block it or trigger the dialog.
+      const messageFiles = new Set(checkpoint.files)
+      const manualInMessage = dirty.filter((file) => messageFiles.has(file))
+      if (manualInMessage.length > 0) {
+        const list =
+          manualInMessage.slice(0, 10).join("\n") +
+          (manualInMessage.length > 10 ? `\n... and ${manualInMessage.length - 10} more` : "")
         const force = await ctx.ui.confirm(
           "Manual edits found",
-          `These files changed since the last run:\n${list}\n\nRestore anyway and lose these edits?`,
+          `These files were changed by the last message and have manual edits since:\n${list}\n\nRestore anyway and lose these edits?`,
         )
         if (!force) {
-          ctx.ui.notify("Undo blocked: working tree has manual edits", "warning")
+          ctx.ui.notify("Undo blocked: working tree has manual edits in files changed by the message", "warning")
           return
         }
       }
 
-      
       const stats = await git.diffNumstat(changes.before, changes.after)
       const preview = formatNumstat(stats.rows, 20, stats.binaryCount)
       const ok = await ctx.ui.confirm(
@@ -123,6 +129,7 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
         return
       }
       skipped = outcome.skipped
+      excluded = outcome.excluded
     }
 
     
@@ -167,6 +174,12 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
         "warning",
       )
     }
+    if (excluded.length > 0) {
+      ctx.ui.notify(
+        `Note: ${excluded.length} file(s) not restored, excluded by pi-undo.json: ${listPaths(excluded)}`,
+        "warning",
+      )
+    }
     if (checkpoint.imageCount > 0) {
       ctx.ui.notify(`Note: ${checkpoint.imageCount} image attachment(s) from the prompt were not restored`, "warning")
     }
@@ -186,13 +199,21 @@ async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
 
   const changes = snapshotChanges(checkpoint)
   let skipped: string[] = []
+  let excluded: string[] = []
   try {
     if (changes) {
       const git = deps.getGit(ctx)
       const dirty = await git.dirtySince(changes.before)
-      if (dirty.length > 0) {
+      // Only files the message changed can be clobbered by the restore.
+      // Manual edits in other files survive the redo, so they must not
+      // block it.
+      const messageFiles = new Set(checkpoint.files)
+      const manualInMessage = dirty.filter((file) => messageFiles.has(file))
+      if (manualInMessage.length > 0) {
+        const listed = manualInMessage.slice(0, 5).join(", ")
+        const more = manualInMessage.length > 5 ? `, ... and ${manualInMessage.length - 5} more` : ""
         ctx.ui.notify(
-          `Redo blocked: working tree has manual edits (${dirty.slice(0, 5).join(", ")})`,
+          `Redo blocked: working tree has manual edits in files changed by the message (${listed}${more})`,
           "warning",
         )
         return
@@ -209,6 +230,7 @@ async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
         return
       }
       skipped = outcome.skipped
+      excluded = outcome.excluded
     }
 
     
@@ -248,6 +270,12 @@ async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
     if (skipped.length > 0) {
       ctx.ui.notify(
         `Note: ${skipped.length} file(s) not restored, a parent directory is a symlink: ${listPaths(skipped)}`,
+        "warning",
+      )
+    }
+    if (excluded.length > 0) {
+      ctx.ui.notify(
+        `Note: ${excluded.length} file(s) not restored, excluded by pi-undo.json: ${listPaths(excluded)}`,
         "warning",
       )
     }
