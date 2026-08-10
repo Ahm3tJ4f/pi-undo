@@ -32,9 +32,9 @@ restart.
 - **Gitignored files are undoable when the session edits them.** The shadow
   repo snapshots gitignored files too, so a file the current pi session
   touched can always be undone, even if it is in `.gitignore`. Manual edits
-  to gitignored files are left alone: they never block undo and are never
-  restored over. Only pi-undo's own `excludeDirectories` are never
-  snapshotted.
+  are never reverted: a gitignored file with manual edits since the message
+  is left alone by undo and redo, with a note. Only pi-undo's own
+  `excludeDirectories` are never snapshotted.
 
 ## Configuration
 

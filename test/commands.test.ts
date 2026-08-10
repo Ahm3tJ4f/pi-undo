@@ -88,7 +88,7 @@ function makeRepo(): {
     },
     async restoreSnapshot(_snapshot, files) {
       state.calls.push(`restore:${_snapshot}:${files.join(",")}`);
-      return { skipped: [], excluded: [] };
+      return { skipped: [], excluded: [], manualSkipped: [] };
     },
     async verifySnapshot(snapshot) {
       state.calls.push(`verify:${snapshot}`);

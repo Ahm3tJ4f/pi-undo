@@ -48,6 +48,7 @@ export function snapshotStoreRoot(): string {
 export interface RestoreResult {
   skipped: string[]
   excluded: string[]
+  manualSkipped: string[]
 }
 
 export interface DiffStatResult {
@@ -60,7 +61,7 @@ export interface SnapshotRepo {
   track(): Promise<string | undefined>
   changedFiles(from: string, to: string): Promise<string[]>
   dirtySince(snapshot: string): Promise<string[]>
-  restoreSnapshot(snapshot: string, files: string[]): Promise<RestoreResult>
+  restoreSnapshot(snapshot: string, files: string[], since?: string): Promise<RestoreResult>
   verifySnapshot(snapshot: string, exclude?: string[]): Promise<boolean>
   diffNumstat(from: string, to: string): Promise<DiffStatResult>
   gcIfDue(): Promise<void>
@@ -140,6 +141,15 @@ export class ShadowGit implements SnapshotRepo {
   }
 
   async dirtySince(snapshot: string): Promise<string[]> {
+    return (await this.dirtyLists(snapshot)).manual
+  }
+
+  // Splits the files changed since `snapshot` into two groups: `manual` are
+  // files undo may clobber (they trigger the manual-edit dialog), `ignored`
+  // are files matched by an exclude rule (our patterns, the project's own
+  // .gitignore, or the source repo's info/exclude). Manual edits to ignored
+  // files are never reverted, so they must never block undo.
+  private async dirtyLists(snapshot: string): Promise<{ manual: string[]; ignored: string[] }> {
     await this.ensure()
     const meta = await this.readMeta()
     await this.syncExcludes(meta.largeExcludes ?? [])
@@ -162,17 +172,16 @@ export class ShadowGit implements SnapshotRepo {
       .map(normalizeGitPath)
       .filter((f): f is string => f !== undefined && !f.endsWith("/"))
     const merged = unique([...tracked, ...untrackedFiles])
-    if (merged.length === 0) return []
-    // Files matched by an exclude rule (our patterns, including globs, the
-    // project's own .gitignore, or the source repo's info/exclude) are never
-    // restored, so manual edits to them must never block undo. This also
-    // covers tracked files still present in the index from before directory
-    // exclusions worked at every depth.
+    if (merged.length === 0) return { manual: [], ignored: [] }
     const ignored = await this.checkIgnored(merged)
-    return merged.filter((file) => !ignored.has(file))
+    const ignoredSet = new Set(ignored)
+    return {
+      manual: merged.filter((file) => !ignoredSet.has(file)),
+      ignored: merged.filter((file) => ignoredSet.has(file)),
+    }
   }
 
-  async restoreSnapshot(snapshot: string, files: string[]): Promise<RestoreResult> {
+  async restoreSnapshot(snapshot: string, files: string[], since?: string): Promise<RestoreResult> {
     await this.ensure()
     // Make sure info/exclude reflects the current config and large-file
     // excludes before the ignore checks below: callers do not always go
@@ -180,10 +189,11 @@ export class ShadowGit implements SnapshotRepo {
     const meta = await this.readMeta()
     await this.syncExcludes(meta.largeExcludes ?? [])
     const rels = unique(files.map(normalizeGitPath).filter((f): f is string => Boolean(f)))
-    if (rels.length === 0) return { skipped: [], excluded: [] }
+    if (rels.length === 0) return { skipped: [], excluded: [], manualSkipped: [] }
 
     const blocked: string[] = []
     const excluded: string[] = []
+    const manualSkipped: string[] = []
     const safe: string[] = []
     // Files that match a current pi-undo exclude rule are not part of any new
     // snapshot, so restoring them from an old tree would clobber manual edits
@@ -194,9 +204,15 @@ export class ShadowGit implements SnapshotRepo {
       ...this.config.excludeDirectories,
       ...(meta.largeExcludes ?? []).map((file) => `/${file.replaceAll("\\", "/")}`),
     ])
+    // Manual edits to gitignored files are never reverted: when `since` is
+    // given (the other snapshot of the message), files that are ignored AND
+    // changed since that snapshot are left alone, even if the session edited
+    // them in the message being undone.
+    const manualSet = since ? new Set((await this.dirtyLists(since)).ignored) : new Set<string>()
     for (const rel of rels) {
       if (await this.hasSymlinkParent(rel)) blocked.push(rel)
       else if (matcher.ignores(rel)) excluded.push(rel)
+      else if (manualSet.has(rel)) manualSkipped.push(rel)
       else safe.push(rel)
     }
     if (blocked.length > 0) {
@@ -205,7 +221,7 @@ export class ShadowGit implements SnapshotRepo {
     if (excluded.length > 0) {
       await this.dropPaths(excluded)
     }
-    if (safe.length === 0) return { skipped: blocked, excluded }
+    if (safe.length === 0) return { skipped: blocked, excluded, manualSkipped }
 
     // Never delete files based on a tree this store does not have (for
     // example a session resumed in a different directory). ls-tree on a
@@ -232,7 +248,7 @@ export class ShadowGit implements SnapshotRepo {
     if (deleted.length > 0) await this.stagePaths(deleted)
 
     await this.checkoutPaths(snapshot, [...present].sort((a, b) => a.length - b.length))
-    return { skipped: blocked, excluded }
+    return { skipped: blocked, excluded, manualSkipped }
   }
 
   private async hasSymlinkParent(rel: string): Promise<boolean> {

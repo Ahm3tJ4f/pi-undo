@@ -33,7 +33,7 @@ function makeHarness(trackQueue: (string | undefined)[] = ["before", "after"]) {
       return [];
     },
     async restoreSnapshot() {
-      return { skipped: [], excluded: [] };
+      return { skipped: [], excluded: [], manualSkipped: [] };
     },
     async verifySnapshot() {
       return true;
@@ -133,7 +133,7 @@ test("capture: failed pre-turn snapshot disables undo for the message", async ()
       return [];
     },
     async restoreSnapshot() {
-      return { skipped: [], excluded: [] };
+      return { skipped: [], excluded: [], manualSkipped: [] };
     },
     async verifySnapshot() {
       return true;

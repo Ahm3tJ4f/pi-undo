@@ -9,15 +9,18 @@ async function restoreFiles(
   git: SnapshotRepo,
   target: string,
   files: string[],
-): Promise<{ ok: boolean; skipped: string[]; excluded: string[] }> {
-  const { skipped, excluded } = await git.restoreSnapshot(target, files)
-  const ok = await git.verifySnapshot(target, [...skipped, ...excluded])
-  return { ok, skipped, excluded }
+  since?: string,
+): Promise<{ ok: boolean; skipped: string[]; excluded: string[]; manualSkipped: string[] }> {
+  const { skipped, excluded, manualSkipped } = await git.restoreSnapshot(target, files, since)
+  const ok = await git.verifySnapshot(target, [...skipped, ...excluded, ...manualSkipped])
+  return { ok, skipped, excluded, manualSkipped }
 }
 
 async function rollbackFiles(git: SnapshotRepo, snapshot: string, files: string[]): Promise<boolean> {
   try {
-    return (await restoreFiles(git, snapshot, files)).ok
+    // Rollback must not clobber manual edits in gitignored files either, so
+    // it skips files with manual edits relative to the rollback target.
+    return (await restoreFiles(git, snapshot, files, snapshot)).ok
   } catch {
     return false
   }
@@ -83,6 +86,7 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
   const changes = snapshotChanges(checkpoint)
   let skipped: string[] = []
   let excluded: string[] = []
+  let manualSkipped: string[] = []
   try {
     if (changes) {
       const git = deps.getGit(ctx)
@@ -117,7 +121,7 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
         return
       }
 
-      const outcome = await restoreFiles(git, changes.before, checkpoint.files)
+      const outcome = await restoreFiles(git, changes.before, checkpoint.files, changes.after)
       if (!outcome.ok) {
         const rolledBack = await rollbackFiles(git, changes.after, checkpoint.files)
         ctx.ui.notify(
@@ -130,6 +134,7 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
       }
       skipped = outcome.skipped
       excluded = outcome.excluded
+      manualSkipped = outcome.manualSkipped
     }
 
     
@@ -180,6 +185,12 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
         "warning",
       )
     }
+    if (manualSkipped.length > 0) {
+      ctx.ui.notify(
+        `Note: ${manualSkipped.length} file(s) not restored, manual edits in gitignored files: ${listPaths(manualSkipped)}`,
+        "warning",
+      )
+    }
     if (checkpoint.imageCount > 0) {
       ctx.ui.notify(`Note: ${checkpoint.imageCount} image attachment(s) from the prompt were not restored`, "warning")
     }
@@ -200,6 +211,7 @@ async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
   const changes = snapshotChanges(checkpoint)
   let skipped: string[] = []
   let excluded: string[] = []
+  let manualSkipped: string[] = []
   try {
     if (changes) {
       const git = deps.getGit(ctx)
@@ -218,7 +230,7 @@ async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
         )
         return
       }
-      const outcome = await restoreFiles(git, changes.after, checkpoint.files)
+      const outcome = await restoreFiles(git, changes.after, checkpoint.files, changes.before)
       if (!outcome.ok) {
         const rolledBack = await rollbackFiles(git, changes.before, checkpoint.files)
         ctx.ui.notify(
@@ -231,6 +243,7 @@ async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
       }
       skipped = outcome.skipped
       excluded = outcome.excluded
+      manualSkipped = outcome.manualSkipped
     }
 
     
@@ -276,6 +289,12 @@ async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
     if (excluded.length > 0) {
       ctx.ui.notify(
         `Note: ${excluded.length} file(s) not restored, excluded by pi-undo.json: ${listPaths(excluded)}`,
+        "warning",
+      )
+    }
+    if (manualSkipped.length > 0) {
+      ctx.ui.notify(
+        `Note: ${manualSkipped.length} file(s) not restored, manual edits in gitignored files: ${listPaths(manualSkipped)}`,
         "warning",
       )
     }

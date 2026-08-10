@@ -138,7 +138,7 @@ test("gitignored files edited during the turn are snapshotted and undoable", asy
     assert.deepEqual(await git.dirtySince(after), []);
 
     // Undo deletes the files created during the turn, gitignored or not.
-    await git.restoreSnapshot(before, ["b.txt", "x.log"]);
+    await git.restoreSnapshot(before, ["b.txt", "x.log"], after);
     await assert.rejects(readFile(path.join(dir, "x.log")));
     await assert.rejects(readFile(path.join(dir, "b.txt")));
     assert.equal(await git.verifySnapshot(before), true);
@@ -378,7 +378,7 @@ test("stale tracked files under excluded dirs are dropped from the index", async
   }
 });
 
-test("restore restores gitignored files even with manual edits", async () => {
+test("restore never reverts manual edits to gitignored files", async () => {
   const dir = await newTempDir("pi-undo-restore-ignored-");
   try {
     await writeFile(path.join(dir, "a.txt"), "one\n");
@@ -392,16 +392,59 @@ test("restore restores gitignored files even with manual edits", async () => {
     const files = await git.changedFiles(before, after);
     assert.deepEqual(files.sort(), ["a.txt", "out.log"]);
 
-    // The project now ignores *.log, and the user edits the file by hand.
-    // The file was edited by the session, so undo still restores it: manual
-    // edits to gitignored files are ignored by the dirty guard.
+    // The project now ignores *.log, and the user edits the file by hand
+    // after the turn. The session did edit the file, but manual edits to
+    // gitignored files are never reverted: undo leaves the file alone.
     await writeFile(path.join(dir, ".gitignore"), "*.log\n");
     await writeFile(path.join(dir, "out.log"), "manual edit\n");
 
-    const result = await git.restoreSnapshot(before, files);
+    const result = await git.restoreSnapshot(before, files, after);
     assert.deepEqual(result.excluded, []);
-    assert.equal(await readFile(path.join(dir, "out.log"), "utf8"), "old\n");
+    assert.deepEqual(result.manualSkipped, ["out.log"]);
+    assert.equal(await readFile(path.join(dir, "out.log"), "utf8"), "manual edit\n");
     assert.equal(await readFile(path.join(dir, "a.txt"), "utf8"), "one\n");
+    // Verification passes when the manual-skipped set is honored, as
+    // restoreFiles does.
+    assert.equal(
+      await git.verifySnapshot(before, [...result.skipped, ...result.excluded, ...result.manualSkipped]),
+      true,
+    );
+
+    // Redo skips it too: the manual edit keeps winning over undo and redo.
+    const redo = await git.restoreSnapshot(after, files, before);
+    assert.deepEqual(redo.manualSkipped, ["out.log"]);
+    assert.equal(await readFile(path.join(dir, "out.log"), "utf8"), "manual edit\n");
+    assert.equal(
+      await git.verifySnapshot(after, [...redo.skipped, ...redo.excluded, ...redo.manualSkipped]),
+      true,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("undo of a gitignored file restores its pre-turn state even with manual edits", async () => {
+  const dir = await newTempDir("pi-undo-restore-ignored2-");
+  try {
+    await writeFile(path.join(dir, ".gitignore"), "out.log\n");
+    await writeFile(path.join(dir, "a.txt"), "one\n");
+    await writeFile(path.join(dir, "out.log"), "manual before turn\n");
+
+    const git = await newShadow(dir);
+    const before = await tracked(git);
+
+    // The session edits the gitignored file on top of the manual edit.
+    await writeFile(path.join(dir, "a.txt"), "one\ntwo\n");
+    await writeFile(path.join(dir, "out.log"), "agent wrote\n");
+    const after = await tracked(git);
+    const files = (await git.changedFiles(before, after)).sort();
+    assert.deepEqual(files, ["a.txt", "out.log"]);
+
+    // No manual edits happened since the turn, so undo restores the
+    // pre-turn state, which includes the manual edit from before the turn.
+    const result = await git.restoreSnapshot(before, files, after);
+    assert.deepEqual(result.manualSkipped, []);
+    assert.equal(await readFile(path.join(dir, "out.log"), "utf8"), "manual before turn\n");
     assert.equal(await git.verifySnapshot(before), true);
   } finally {
     await rm(dir, { recursive: true, force: true });

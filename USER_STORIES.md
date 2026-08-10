@@ -80,14 +80,14 @@ Severity: **core** = must always work, **edge** = rare but should not break badl
 - US-57 (core) The session edits a gitignored file (`.gitignore`, local
   excludes, global gitignore): the file is snapshotted like a normal file,
   `/undo` and `/redo` restore it, and the diff preview shows it.
-- US-58 (core) A gitignored file has manual edits: those edits never block
-  undo or redo, and undo never touches the file unless the session edited it
-  in the message being undone.
+- US-58 (core) A gitignored file has manual edits since the message: undo and
+  redo leave the file alone and never block on it. Manual edits are never
+  reverted, even in a file the session edited during the message.
 - US-59 (core) The session edits a gitignored file that had manual edits
   before the turn: `/undo` restores the pre-turn state, manual edits included.
 - US-60 (edge) A gitignored file the session edited gets manual edits after
-  the turn: `/undo` still restores it (manual edits to gitignored files are
-  ignored by the dirty guard), and the manual edits are lost.
+  the turn: `/undo` and `/redo` skip the file and keep the manual edits, with
+  a note. The session's edit to that file is then not undone either.
 - US-61 (edge) A file becomes gitignored after it was snapshotted: it stays
   snapshotted; the session's edits to it remain undoable. Only pi-undo's own
   `excludeDirectories` stop new snapshots of a file.
