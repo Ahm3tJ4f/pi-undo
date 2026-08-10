@@ -29,6 +29,12 @@ restart.
   edits trigger a question first, so nothing gets clobbered.
 - **Two snapshots per message.** Each user message gets a before and an
   after tree hash. Undo restores only the files that message changed.
+- **Gitignored files are undoable when the session edits them.** The shadow
+  repo snapshots gitignored files too, so a file the current pi session
+  touched can always be undone, even if it is in `.gitignore`. Manual edits
+  to gitignored files are left alone: they never block undo and are never
+  restored over. Only pi-undo's own `excludeDirectories` are never
+  snapshotted.
 
 ## Configuration
 

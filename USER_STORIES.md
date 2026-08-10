@@ -75,6 +75,26 @@ Severity: **core** = must always work, **edge** = rare but should not break badl
   and the restore: the post-restore verification fails and pi-undo rolls the
   files back to the after-state.
 
+## 3b. Gitignored files
+
+- US-57 (core) The session edits a gitignored file (`.gitignore`, local
+  excludes, global gitignore): the file is snapshotted like a normal file,
+  `/undo` and `/redo` restore it, and the diff preview shows it.
+- US-58 (core) A gitignored file has manual edits: those edits never block
+  undo or redo, and undo never touches the file unless the session edited it
+  in the message being undone.
+- US-59 (core) The session edits a gitignored file that had manual edits
+  before the turn: `/undo` restores the pre-turn state, manual edits included.
+- US-60 (edge) A gitignored file the session edited gets manual edits after
+  the turn: `/undo` still restores it (manual edits to gitignored files are
+  ignored by the dirty guard), and the manual edits are lost.
+- US-61 (edge) A file becomes gitignored after it was snapshotted: it stays
+  snapshotted; the session's edits to it remain undoable. Only pi-undo's own
+  `excludeDirectories` stop new snapshots of a file.
+- US-62 (edge) A file becomes excluded by `excludeDirectories` after it was
+  snapshotted: restore skips it, keeps manual edits, and drops it from the
+  index (transition window).
+
 ## 4. Failures and verification
 
 - US-30 (core) Restore fails partway (git checkout error): pi-undo rolls the
@@ -118,7 +138,8 @@ Severity: **core** = must always work, **edge** = rare but should not break badl
 - US-45 (core) Undo in `~/`: no false manual-edits dialog, restore only
   touches the message's files.
 - US-46 (core) Files under blacklisted dirs (node_modules, dist, tool caches)
-  are not snapshotted and not undoable.
+  are not snapshotted and not undoable. This is pi-undo's own exclusion list;
+  the project's `.gitignore` does NOT exclude files from snapshots.
 - US-47 (edge) Edits inside nested git repos are not undoable (the repo has
   its own git undo).
 - US-48 (edge) A file that was snapshotted earlier and later becomes

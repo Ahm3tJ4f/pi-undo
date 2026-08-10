@@ -5,6 +5,7 @@ import { copyFile, lstat, mkdir, readFile, readdir, rm, stat as fsStat, writeFil
 import { homedir, tmpdir } from "node:os"
 import path from "node:path"
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
+import ignore from "ignore"
 import { DEFAULT_CONFIG, type PiUndoConfig } from "./config.ts"
 import type { NumstatRow } from "./util.ts"
 import { literalPathspec, normalizeGitPath, nulSplit, unique } from "./util.ts"
@@ -162,11 +163,11 @@ export class ShadowGit implements SnapshotRepo {
       .filter((f): f is string => f !== undefined && !f.endsWith("/"))
     const merged = unique([...tracked, ...untrackedFiles])
     if (merged.length === 0) return []
-    // Files matched by an exclude rule (our patterns, including globs, or the
-    // project's own .gitignore) are never part of any snapshot, so they are
-    // never restored and must never block undo. This also covers tracked
-    // files still present in the index from before directory exclusions
-    // worked at every depth.
+    // Files matched by an exclude rule (our patterns, including globs, the
+    // project's own .gitignore, or the source repo's info/exclude) are never
+    // restored, so manual edits to them must never block undo. This also
+    // covers tracked files still present in the index from before directory
+    // exclusions worked at every depth.
     const ignored = await this.checkIgnored(merged)
     return merged.filter((file) => !ignored.has(file))
   }
@@ -184,14 +185,18 @@ export class ShadowGit implements SnapshotRepo {
     const blocked: string[] = []
     const excluded: string[] = []
     const safe: string[] = []
-    // Files that match a current exclude rule are not part of any new
+    // Files that match a current pi-undo exclude rule are not part of any new
     // snapshot, so restoring them from an old tree would clobber manual edits
-    // that dirtySince explicitly promised not to touch (the transition window
-    // after an exclude rule appears). Skip them like symlink-blocked files.
-    const nowExcluded = await this.checkIgnored(rels)
+    // (the transition window after an exclude rule appears). Skip them like
+    // symlink-blocked files. Files ignored only by the project's own
+    // .gitignore ARE part of new snapshots, so they are restored normally.
+    const matcher = ignore().add([
+      ...this.config.excludeDirectories,
+      ...(meta.largeExcludes ?? []).map((file) => `/${file.replaceAll("\\", "/")}`),
+    ])
     for (const rel of rels) {
       if (await this.hasSymlinkParent(rel)) blocked.push(rel)
-      else if (nowExcluded.has(rel)) excluded.push(rel)
+      else if (matcher.ignores(rel)) excluded.push(rel)
       else safe.push(rel)
     }
     if (blocked.length > 0) {
@@ -367,9 +372,19 @@ export class ShadowGit implements SnapshotRepo {
     const meta = await this.readMeta()
     const largeExcludes = meta.largeExcludes ?? []
     await this.syncExcludes(largeExcludes)
+    // Files tracked before an exclude directory was configured (or before
+    // this cleanup existed) stay in the index forever, bloat every snapshot
+    // and surface as false manual edits. Drop them before the listings so
+    // they never enter a snapshot again. Gitignored files are NOT dropped:
+    // the current pi session's edits to them must stay undoable.
+    await this.dropTrackedUnderExcludedDirs()
     const [changed, untracked] = await Promise.all([
       this.git(["diff-files", "--name-only", "-z", "--", ".", ...PI_EXCLUDE], { allowFailure: true }),
-      this.git(["ls-files", "--full-name", "--others", "--exclude-standard", "-z", "--", ".", ...PI_EXCLUDE], {
+      // No --exclude-standard: files ignored by the project's own .gitignore
+      // are snapshotted too, so the session's edits to them are undoable.
+      // Only pi-undo's own patterns (excludeDirectories, large files) filter
+      // the listing, via the pi-undo-exclude file.
+      this.git(["ls-files", "--full-name", "--others", "-z", "--exclude-from", this.excludeFile(), "--", ".", ...PI_EXCLUDE], {
         allowFailure: true,
       }),
     ])
@@ -380,11 +395,6 @@ export class ShadowGit implements SnapshotRepo {
       .map(normalizeGitPath)
       .filter((f): f is string => Boolean(f))
     const all = unique([...changedList, ...untrackedList])
-    // Files tracked before an exclude directory was configured (or before
-    // this cleanup existed) stay in the index forever, bloat every snapshot
-    // and surface as false manual edits. Drop them so snapshots only ever
-    // contain files pi-undo is allowed to track.
-    await this.dropTrackedUnderExcludedDirs()
     if (all.length === 0) return true
 
     const nested = new Set<string>()
@@ -415,23 +425,15 @@ export class ShadowGit implements SnapshotRepo {
       return false
     }
 
-    // Untracked files are already filtered by --exclude-standard and git add
-    // skips ignored untracked paths, so only tracked changes can be newly
-    // ignored and need an explicit check-ignore pass.
-    const ignored = await this.checkIgnored(changedList)
-    if (ignored.size > 0) await this.dropPaths([...ignored])
-    const allow = allowAll.filter((file) => !ignored.has(file))
-    if (allow.length === 0) return true
-
     const untrackedSet = new Set(untrackedList)
-    const large = await this.findLargeFiles(allow.filter((file) => untrackedSet.has(file)))
+    const large = await this.findLargeFiles(allowAll.filter((file) => untrackedSet.has(file)))
     if (large.size > 0) {
       const next = unique([...largeExcludes, ...large]).slice(0, MAX_LARGE_EXCLUDES)
       await this.writeMeta({ largeExcludes: next })
       await this.syncExcludes(next)
     }
 
-    await this.stagePaths(allow.filter((file) => !large.has(file)))
+    await this.stagePaths(allowAll.filter((file) => !large.has(file)))
     return true
   }
 
@@ -461,11 +463,12 @@ export class ShadowGit implements SnapshotRepo {
 
   private async stagePaths(files: string[]): Promise<void> {
     if (files.length === 0) return
-    if (await this.tryPathspec(["add", "--all", "--sparse"], files)) return
+    // -f: gitignored files are snapshotted too, and plain "git add" skips them.
+    if (await this.tryPathspec(["add", "-f", "--all", "--sparse"], files)) return
 
     const failed: string[] = []
     for (const file of files) {
-      if (!(await this.tryPathspec(["add", "--all", "--sparse"], [file]))) failed.push(file)
+      if (!(await this.tryPathspec(["add", "-f", "--all", "--sparse"], [file]))) failed.push(file)
     }
     if (failed.length > 0) {
       this.warn(`pi-undo: could not stage ${failed.length} path(s) for snapshot: ${failed.join(", ")}`)
@@ -577,6 +580,10 @@ export class ShadowGit implements SnapshotRepo {
     return groups
   }
 
+  private excludeFile(): string {
+    return path.join(this.gitdir, "info", "pi-undo-exclude")
+  }
+
   private async syncExcludes(extra: string[] = []): Promise<void> {
     const source = await this.sourceGitDir()
     let text = ""
@@ -586,7 +593,6 @@ export class ShadowGit implements SnapshotRepo {
         text = (await readFile(excludePath, "utf8")).trimEnd()
       }
     }
-    const lines: string[] = text ? text.split("\n") : []
     // Entries are written as-is: full gitignore glob syntax, no leading slash
     // (so plain names match at any depth) and no forced trailing slash (so
     // "node_modules/" keeps its gitignore meaning of directories only, and
@@ -594,35 +600,41 @@ export class ShadowGit implements SnapshotRepo {
     // snapshot contains projects in subdirectories
     // (github/<repo>/node_modules/...), so a root-anchored /node_modules/
     // would let every one of those nested copies into the snapshot.
-    for (const name of this.config.excludeDirectories) {
-      lines.push(name.replaceAll("\\", "/"))
-    }
+    const configLines = this.config.excludeDirectories.map((name) => name.replaceAll("\\", "/"))
+    // Keep only the large-file excludes that no config pattern covers.
+    // Entries covered by a config pattern are redundant; entries covered only
+    // by the project's own ignore rules are still needed, because gitignored
+    // files are snapshotted and would be re-detected on every track.
+    const matcher = ignore().add(configLines)
+    const largeLines = extra
+      .filter((file) => !matcher.ignores(file.replaceAll("\\", "/")))
+      .map((file) => `/${file.replaceAll("\\", "/")}`)
+    // info/exclude feeds git's own ignore matching for the manual-edit guard:
+    // it must cover the source repo's local excludes too, so manual edits to
+    // any gitignored file never block undo.
+    const lines: string[] = text ? text.split("\n") : []
+    lines.push(...configLines, ...largeLines)
     await mkdir(path.join(this.gitdir, "info"), { recursive: true })
     await writeFile(path.join(this.gitdir, "info", "exclude"), lines.join("\n") + "\n")
-    if (extra.length === 0) return
-    // Keep only the large-file excludes that no current pattern covers.
-    // Entries already ignored by the config or by the project's own ignore
-    // rules are redundant, and without this cleanup the exclude file grows
-    // without bound (each pattern slows every tree walk). Delegating to git's
-    // own matcher means glob patterns in excludeDirectories are honored.
-    const ignored = await this.checkIgnored(extra)
-    for (const file of extra) {
-      if (!ignored.has(file)) lines.push(`/${file.replaceAll("\\", "/")}`)
-    }
-    await writeFile(path.join(this.gitdir, "info", "exclude"), lines.join("\n") + "\n")
+    // pi-undo-exclude feeds the snapshot side (staging filters): only
+    // pi-undo's own patterns, never the project's gitignore rules.
+    await writeFile(this.excludeFile(), [...configLines, ...largeLines].join("\n") + "\n")
   }
 
-  // Removes from the index any tracked file that the standard exclusions
-  // consider ignored. Such files were staged before directory exclusions
-  // worked at every depth (root-anchored patterns) or came from a seeded
-  // source index; once tracked they never honor info/exclude and would be
-  // snapshotted and reported as manual edits forever. Delegating to git's own
-  // matcher (ls-files -i) means glob patterns in excludeDirectories are
-  // honored for free.
+  // Removes from the index any tracked file that a pi-undo exclude rule
+  // (excludeDirectories or a large-file rule) considers ignored. Such files
+  // were staged before directory exclusions worked at every depth
+  // (root-anchored patterns) or came from a seeded source index; once tracked
+  // they never honor info/exclude and would be snapshotted and reported as
+  // manual edits forever. Delegating to git's own matcher (ls-files -i with
+  // the pi-undo-exclude file) means glob patterns in excludeDirectories are
+  // honored for free. Files ignored by the project's own .gitignore are kept:
+  // the session's edits to them stay undoable.
   private async dropTrackedUnderExcludedDirs(): Promise<void> {
-    const result = await this.git(["ls-files", "-c", "-i", "--exclude-standard", "--full-name", "-z"], {
-      allowFailure: true,
-    })
+    const result = await this.git(
+      ["ls-files", "-c", "-i", "--exclude-from", this.excludeFile(), "--full-name", "-z"],
+      { allowFailure: true },
+    )
     if (result.code !== 0) return
     const stale = nulSplit(result.stdout)
       .map(normalizeGitPath)

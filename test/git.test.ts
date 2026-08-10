@@ -118,7 +118,7 @@ test("tracks, diffs and verifies in a non-git directory", async () => {
   }
 });
 
-test("ignored files are not snapshotted and not dirty", async () => {
+test("gitignored files edited during the turn are snapshotted and undoable", async () => {
   const dir = await newTempDir("pi-undo-ignore-");
   try {
     await writeFile(path.join(dir, ".gitignore"), "*.log\n");
@@ -127,13 +127,81 @@ test("ignored files are not snapshotted and not dirty", async () => {
     const git = await newShadow(dir);
     const before = await tracked(git);
 
+    // The turn creates a gitignored file and edits a normal one.
     await writeFile(path.join(dir, "x.log"), "noise\n");
     await writeFile(path.join(dir, "b.txt"), "two\n");
     const after = await tracked(git);
 
-    assert.deepEqual(await git.changedFiles(before, after), ["b.txt"]);
+    // The gitignored file is part of the snapshot, so the session's edit to
+    // it is undoable.
+    assert.deepEqual((await git.changedFiles(before, after)).sort(), ["b.txt", "x.log"]);
     assert.deepEqual(await git.dirtySince(after), []);
-    await git.restoreSnapshot(before, ["b.txt"]);
+
+    // Undo deletes the files created during the turn, gitignored or not.
+    await git.restoreSnapshot(before, ["b.txt", "x.log"]);
+    await assert.rejects(readFile(path.join(dir, "x.log")));
+    await assert.rejects(readFile(path.join(dir, "b.txt")));
+    assert.equal(await git.verifySnapshot(before), true);
+
+    // Redo recreates them.
+    await git.restoreSnapshot(after, ["b.txt", "x.log"]);
+    assert.equal(await readFile(path.join(dir, "x.log"), "utf8"), "noise\n");
+    assert.equal(await readFile(path.join(dir, "b.txt"), "utf8"), "two\n");
+    assert.equal(await git.verifySnapshot(after), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("manual edits to gitignored files are never restored and never block undo", async () => {
+  const dir = await newTempDir("pi-undo-manual-ignored-");
+  try {
+    await writeFile(path.join(dir, ".gitignore"), ".env\n");
+    await writeFile(path.join(dir, ".env"), "SECRET=manual\n");
+    await writeFile(path.join(dir, "a.txt"), "one\n");
+
+    const git = await newShadow(dir);
+    const before = await tracked(git);
+
+    // The session only touches a.txt; the gitignored .env keeps its manual
+    // edit and is not part of the message's files.
+    await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
+    const after = await tracked(git);
+
+    assert.deepEqual(await git.changedFiles(before, after), ["a.txt"]);
+    // Manual edits to gitignored files never surface as dirty.
+    await writeFile(path.join(dir, ".env"), "SECRET=edited by hand\n");
+    assert.deepEqual(await git.dirtySince(after), []);
+
+    // Undo restores only the message's files; the manual .env edit survives.
+    await git.restoreSnapshot(before, ["a.txt"]);
+    assert.equal(await readFile(path.join(dir, ".env"), "utf8"), "SECRET=edited by hand\n");
+    assert.equal(await readFile(path.join(dir, "a.txt"), "utf8"), "one\n");
+    assert.equal(await git.verifySnapshot(before), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("undo of a gitignored file restores its pre-turn state", async () => {
+  const dir = await newTempDir("pi-undo-ignored-turn-");
+  try {
+    await writeFile(path.join(dir, ".gitignore"), ".env\n");
+    await writeFile(path.join(dir, "a.txt"), "one\n");
+    await writeFile(path.join(dir, ".env"), "SECRET=manual before turn\n");
+
+    const git = await newShadow(dir);
+    const before = await tracked(git);
+
+    // The session edits the gitignored file.
+    await writeFile(path.join(dir, ".env"), "SECRET=agent wrote\n");
+    const after = await tracked(git);
+    const files = await git.changedFiles(before, after);
+    assert.deepEqual(files, [".env"]);
+
+    // Undo restores the pre-turn state, which includes the manual edit.
+    await git.restoreSnapshot(before, files);
+    assert.equal(await readFile(path.join(dir, ".env"), "utf8"), "SECRET=manual before turn\n");
     assert.equal(await git.verifySnapshot(before), true);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -310,8 +378,8 @@ test("stale tracked files under excluded dirs are dropped from the index", async
   }
 });
 
-test("restore skips files that became excluded and keeps manual edits", async () => {
-  const dir = await newTempDir("pi-undo-restore-excl-");
+test("restore restores gitignored files even with manual edits", async () => {
+  const dir = await newTempDir("pi-undo-restore-ignored-");
   try {
     await writeFile(path.join(dir, "a.txt"), "one\n");
     await writeFile(path.join(dir, "out.log"), "old\n");
@@ -325,19 +393,52 @@ test("restore skips files that became excluded and keeps manual edits", async ()
     assert.deepEqual(files.sort(), ["a.txt", "out.log"]);
 
     // The project now ignores *.log, and the user edits the file by hand.
+    // The file was edited by the session, so undo still restores it: manual
+    // edits to gitignored files are ignored by the dirty guard.
     await writeFile(path.join(dir, ".gitignore"), "*.log\n");
     await writeFile(path.join(dir, "out.log"), "manual edit\n");
 
     const result = await git.restoreSnapshot(before, files);
-    assert.deepEqual(result.excluded.sort(), ["out.log"]);
+    assert.deepEqual(result.excluded, []);
+    assert.equal(await readFile(path.join(dir, "out.log"), "utf8"), "old\n");
+    assert.equal(await readFile(path.join(dir, "a.txt"), "utf8"), "one\n");
+    assert.equal(await git.verifySnapshot(before), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("restore skips files that became config-excluded and keeps manual edits", async () => {
+  const dir = await newTempDir("pi-undo-restore-excl-");
+  try {
+    await writeFile(path.join(dir, "a.txt"), "one\n");
+    await writeFile(path.join(dir, "out.log"), "old\n");
+    const git = await newShadow(dir);
+    const before = await tracked(git);
+
+    await writeFile(path.join(dir, "a.txt"), "one\ntwo\n");
+    await writeFile(path.join(dir, "out.log"), "new\n");
+    const after = await tracked(git);
+    const files = await git.changedFiles(before, after);
+    assert.deepEqual(files.sort(), ["a.txt", "out.log"]);
+
+    // The pi-undo config now excludes *.log, and the user edits the file by
+    // hand. Restoring it from an old tree would clobber the manual edit, so
+    // pi-undo skips it, like before.
+    await writeFile(path.join(dir, "out.log"), "manual edit\n");
+    const strict = new ShadowGit(fakePi(), dir, undefined, {
+      excludeDirectories: ["*.log"],
+      maxFiles: 5,
+    });
+    await strict.ensure();
+
+    const result = await strict.restoreSnapshot(before, files);
+    assert.deepEqual(result.excluded, ["out.log"]);
     // The manual edit survives, the rest is restored.
     assert.equal(await readFile(path.join(dir, "out.log"), "utf8"), "manual edit\n");
     assert.equal(await readFile(path.join(dir, "a.txt"), "utf8"), "one\n");
-    // Verification passes when both skipped sets are honored, as restoreFiles does.
-    assert.equal(
-      await git.verifySnapshot(before, [...result.skipped, ...result.excluded]),
-      true,
-    );
+    // Verification passes when the excluded set is honored, as restoreFiles does.
+    assert.equal(await strict.verifySnapshot(before, [...result.skipped, ...result.excluded]), true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -382,11 +483,11 @@ test("seeds from the source repo: no blobs are stored twice", async () => {
   }
 });
 
-test("source repo ignore rules (info/exclude) are honored", async () => {
+test("source repo info/exclude files are snapshotted when the session edits them", async () => {
   const dir = await newTempDir("pi-undo-excl-");
   try {
     await makeSourceRepo(dir, { "a.txt": "one\n" });
-    
+
     const gitDir = await exec("git", ["rev-parse", "--absolute-git-dir"], {
       cwd: dir,
     });
@@ -398,11 +499,15 @@ test("source repo ignore rules (info/exclude) are honored", async () => {
     const git = await newShadow(dir);
     const before = await tracked(git);
 
+    // The session creates the locally-excluded file: it is snapshotted, so
+    // the edit is undoable.
     await writeFile(path.join(dir, "secret.tmp"), "nope\n");
     await writeFile(path.join(dir, "b.txt"), "two\n");
     const after = await tracked(git);
 
-    assert.deepEqual(await git.changedFiles(before, after), ["b.txt"]);
+    assert.deepEqual((await git.changedFiles(before, after)).sort(), ["b.txt", "secret.tmp"]);
+    // Manual edits to it still never block undo.
+    await writeFile(path.join(dir, "secret.tmp"), "manual\n");
     assert.deepEqual(await git.dirtySince(after), []);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -544,24 +649,32 @@ test("restore: never deletes or writes through a symlinked parent directory", as
   }
 })
 
-test("tracked files that become ignored are dropped from snapshots", async () => {
+test("tracked files that become gitignored stay snapshotted", async () => {
   const dir = await newTempDir("pi-undo-trig-");
   try {
     await writeFile(path.join(dir, "a.txt"), "one\n");
     const git = await newShadow(dir);
     const before = await tracked(git);
 
-    
+    // The project now ignores a.txt, and the session edits it.
     await writeFile(path.join(dir, ".gitignore"), "a.txt\n");
     await writeFile(path.join(dir, "a.txt"), "changed\n");
     const after = await tracked(git);
 
-    
-    
+    // Still snapshotted and undoable. (.gitignore itself is snapshotted too,
+    // since the session created it.)
+    const files = (await git.changedFiles(before, after)).sort();
+    assert.deepEqual(files, [".gitignore", "a.txt"]);
+    await git.restoreSnapshot(before, files);
+    assert.equal(await readFile(path.join(dir, "a.txt"), "utf8"), "one\n");
+    assert.equal(await git.verifySnapshot(before), true);
+
+    // The project still ignores a.txt; manual edits after the turn never
+    // surface as dirty (the .gitignore file itself may, that is harmless).
+    await writeFile(path.join(dir, ".gitignore"), "a.txt\n");
     await writeFile(path.join(dir, "a.txt"), "manual edit\n");
-    assert.deepEqual(await git.dirtySince(after), []);
-    
-    assert.ok((await git.changedFiles(before, after)).includes("a.txt"));
+    const dirty = await git.dirtySince(after);
+    assert.ok(!dirty.includes("a.txt"), "manual edits to gitignored files must not block undo");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
