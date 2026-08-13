@@ -77,6 +77,7 @@ function makeRepo(): {
     restoreOpts: [] as ({ manualSet?: ReadonlySet<string>; force?: boolean } | undefined)[],
   };
   const repo: SnapshotRepo = {
+    storeDir: "/tmp/fake-store",
     async ensure() {},
     async track() {
       state.calls.push("track");
@@ -89,6 +90,10 @@ function makeRepo(): {
     async dirtySince() {
       state.calls.push("dirtySince");
       return state.dirty;
+    },
+    async dirtySinceAll() {
+      state.calls.push("dirtySinceAll");
+      return { manual: state.dirty, ignored: [] };
     },
     async restoreSnapshot(_snapshot, files, _since, opts) {
       state.calls.push(`restore:${_snapshot}:${files.join(",")}`);
@@ -120,6 +125,7 @@ function makeCheckpoint(overrides: Partial<Checkpoint> = {}): Checkpoint {
     beforeSnapshot: "before1",
     afterSnapshot: "after1",
     files: ["a.txt"],
+    unattributed: [],
     createdAt: 1,
     ...overrides,
   };

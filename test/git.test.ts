@@ -98,11 +98,11 @@ test("tracks, diffs and verifies in a non-git directory", async () => {
       "a.txt",
       "c.txt",
     ]);
-    assert.deepEqual(await git.dirtySince(after), []);
+    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
 
     
     await writeFile(path.join(dir, "a.txt"), "user edit\n");
-    assert.deepEqual(await git.dirtySince(after), ["a.txt"]);
+    assert.deepEqual((await git.dirtySinceAll(after)).manual, ["a.txt"]);
 
     
     await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
@@ -135,7 +135,7 @@ test("gitignored files edited during the turn are snapshotted and undoable", asy
     // The gitignored file is part of the snapshot, so the session's edit to
     // it is undoable.
     assert.deepEqual((await git.changedFiles(before, after)).sort(), ["b.txt", "x.log"]);
-    assert.deepEqual(await git.dirtySince(after), []);
+    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
 
     // Undo deletes the files created during the turn, gitignored or not.
     await git.restoreSnapshot(before, ["b.txt", "x.log"], after);
@@ -171,7 +171,7 @@ test("manual edits to gitignored files are never restored and never block undo",
     assert.deepEqual(await git.changedFiles(before, after), ["a.txt"]);
     // Manual edits to gitignored files never surface as dirty.
     await writeFile(path.join(dir, ".env"), "SECRET=edited by hand\n");
-    assert.deepEqual(await git.dirtySince(after), []);
+    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
 
     // Undo restores only the message's files; the manual .env edit survives.
     await git.restoreSnapshot(before, ["a.txt"]);
@@ -277,7 +277,7 @@ test("untracked files over the size cap are excluded from snapshots", async () =
     assert.deepEqual(await git.changedFiles(before, after), []);
     // Even though the big file is untracked, it must not show up as a manual
     // edit: it is excluded via the exact-path large-file rule.
-    assert.deepEqual(await git.dirtySince(after), []);
+    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -300,7 +300,7 @@ test("excludeDirectories match at any depth, not only the snapshot root", async 
     const after = await tracked(git);
 
     assert.deepEqual(await git.changedFiles(before, after), ["a.txt"]);
-    assert.deepEqual(await git.dirtySince(after), []);
+    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
     // The nested files must not be part of any snapshot.
     const files = await exec(
       "git",
@@ -333,7 +333,7 @@ test("glob patterns in excludeDirectories are honored everywhere", async () => {
     await writeFile(path.join(dir, "sub", "build-1", "new.js"), "two\n");
     const after = await tracked(git);
     assert.deepEqual(await git.changedFiles(before, after), ["a.txt"]);
-    assert.deepEqual(await git.dirtySince(after), []);
+    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
 
     // 2) A stale tracked file under a glob dir is dropped on the next track.
     // Stage it by hand (as if tracked before globs existed), then track.
@@ -346,7 +346,7 @@ test("glob patterns in excludeDirectories are honored everywhere", async () => {
     const files = await exec("git", ["--git-dir", gitDir, "ls-files"], { cwd: dir });
     assert.ok(!files.stdout.includes("build-1"), "glob-covered file stayed in the index");
     assert.deepEqual(await git.changedFiles(before, afterDrop), ["a.txt"]);
-    assert.deepEqual(await git.dirtySince(afterDrop), []);
+    assert.deepEqual((await git.dirtySinceAll(afterDrop)).manual, []);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -371,7 +371,7 @@ test("file globs in excludeDirectories exclude files, not only directories", asy
     const after = await tracked(git);
 
     assert.deepEqual(await git.changedFiles(before, after), ["a.txt"]);
-    assert.deepEqual(await git.dirtySince(after), []);
+    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -397,7 +397,7 @@ test("excludeDirectories entries with a trailing slash still match", async () =>
     const after = await tracked(git);
 
     assert.deepEqual(await git.changedFiles(before, after), ["a.txt"]);
-    assert.deepEqual(await git.dirtySince(after), []);
+    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -427,7 +427,7 @@ test("stale tracked files under excluded dirs are dropped from the index", async
     const after = await tracked(git);
 
     assert.deepEqual(await git.changedFiles(before, after), []);
-    assert.deepEqual(await git.dirtySince(after), []);
+    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -606,7 +606,7 @@ test("source repo info/exclude files are snapshotted when the session edits them
     assert.deepEqual((await git.changedFiles(before, after)).sort(), ["b.txt", "secret.tmp"]);
     // Manual edits to it still never block undo.
     await writeFile(path.join(dir, "secret.tmp"), "manual\n");
-    assert.deepEqual(await git.dirtySince(after), []);
+    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -771,7 +771,7 @@ test("tracked files that become gitignored stay snapshotted", async () => {
     // surface as dirty (the .gitignore file itself may, that is harmless).
     await writeFile(path.join(dir, ".gitignore"), "a.txt\n");
     await writeFile(path.join(dir, "a.txt"), "manual edit\n");
-    const dirty = await git.dirtySince(after);
+    const dirty = (await git.dirtySinceAll(after)).manual;
     assert.ok(!dirty.includes("a.txt"), "manual edits to gitignored files must not block undo");
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -829,7 +829,7 @@ test("nested git repos are excluded: edits inside them are not undoable", async 
 
     // Nested repos are never snapshotted, so they must not be reported as
     // manual edits either.
-    assert.deepEqual(await git.dirtySince(before), []);
+    assert.deepEqual((await git.dirtySinceAll(before)).manual, []);
 
     
     await writeFile(path.join(dir, "root.txt"), "edited\n");
@@ -839,7 +839,7 @@ test("nested git repos are excluded: edits inside them are not undoable", async 
 
     
     assert.deepEqual(await git.changedFiles(before, after), ["root.txt"]);
-    assert.deepEqual(await git.dirtySince(after), []);
+    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
 
     
     await git.restoreSnapshot(before, ["root.txt"]);
@@ -867,7 +867,7 @@ test("default junk dirs are not snapshotted", async () => {
     const after = await tracked(git);
 
     assert.deepEqual(await git.changedFiles(before, after), ["b.txt"]);
-    assert.deepEqual(await git.dirtySince(after), []);
+    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -1067,7 +1067,7 @@ test("fifos in the worktree do not break tracking", async () => {
     await writeFile(path.join(dir, "b.txt"), "two\n");
     const after = await tracked(git);
     assert.deepEqual(await git.changedFiles(before, after), ["b.txt"]);
-    assert.deepEqual(await git.dirtySince(after), []);
+    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -60,7 +60,10 @@ export interface SnapshotRepo {
   ensure(): Promise<void>
   track(): Promise<string | undefined>
   changedFiles(from: string, to: string): Promise<string[]>
+  readonly storeDir: string
+  /** @deprecated use dirtySinceAll */
   dirtySince(snapshot: string): Promise<string[]>
+  dirtySinceAll(snapshot: string): Promise<{ manual: string[]; ignored: string[] }>
   restoreSnapshot(
     snapshot: string,
     files: string[],
@@ -98,6 +101,10 @@ export class ShadowGit implements SnapshotRepo {
 
   setWarn(warn: (message: string) => void): void {
     this.warn = warn
+  }
+
+  get storeDir(): string {
+    return this.gitdir
   }
 
   async ensure(): Promise<void> {
@@ -145,8 +152,13 @@ export class ShadowGit implements SnapshotRepo {
     return unique(nulSplit(result.stdout).map(normalizeGitPath).filter((f): f is string => Boolean(f)))
   }
 
+  /** @deprecated use dirtySinceAll */
   async dirtySince(snapshot: string): Promise<string[]> {
     return (await this.dirtyLists(snapshot)).manual
+  }
+
+  async dirtySinceAll(snapshot: string): Promise<{ manual: string[]; ignored: string[] }> {
+    return this.dirtyLists(snapshot)
   }
 
   // Splits the files changed since `snapshot` into two groups: `manual` are

@@ -17,6 +17,8 @@ export interface Checkpoint {
   afterSnapshot: string | null
   
   files: string[]
+  
+  unattributed: string[]
   createdAt: number
 }
 
@@ -31,6 +33,8 @@ export interface ActiveTurn {
   userEntryId: string | null
   beforeLeafId: string | null
   beforeSnapshot: string | null
+  
+  touched: Set<string>
 }
 
 export type UserMessageEntry = Extract<SessionEntry, { type: "message" }> & {

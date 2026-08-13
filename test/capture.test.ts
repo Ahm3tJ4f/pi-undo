@@ -1,15 +1,28 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { setupCapture, type CaptureDeps } from "../src/capture.ts";
 import type { SnapshotRepo } from "../src/git.ts";
+import { sessionJournalFile } from "../src/journal.ts";
 import { CheckpointStore } from "../src/store.ts";
 
 type Handler = (event: unknown, ctx: unknown) => Promise<void> | void;
 
-function makeHarness(trackQueue: (string | undefined)[] = ["before", "after"]) {
+interface HarnessOptions {
+  trackQueue?: (string | undefined)[]
+  changedFiles?: string[]
+  storeDir?: string
+}
+
+function makeHarness(options: HarnessOptions = {}) {
+  const trackQueue = options.trackQueue ?? ["before", "after"];
+  const changedFilesResult = options.changedFiles ?? ["a.txt"];
+  const storeDir = options.storeDir ?? "/tmp/fake-store";
   const handlers = new Map<string, Handler>();
   const fakePi = {
     on: (event: string, handler: Handler) => void handlers.set(event, handler),
@@ -19,6 +32,7 @@ function makeHarness(trackQueue: (string | undefined)[] = ["before", "after"]) {
   const store = new CheckpointStore(fakePi);
   const calls: string[] = [];
   const repo: SnapshotRepo = {
+    storeDir,
     async ensure() {},
     async track() {
       calls.push("track");
@@ -27,10 +41,13 @@ function makeHarness(trackQueue: (string | undefined)[] = ["before", "after"]) {
     },
     async changedFiles(from, to) {
       calls.push(`changedFiles:${from}:${to}`);
-      return ["a.txt"];
+      return changedFilesResult;
     },
     async dirtySince() {
       return [];
+    },
+    async dirtySinceAll() {
+      return { manual: [], ignored: [] };
     },
     async restoreSnapshot() {
       return { skipped: [], excluded: [], manualSkipped: [] };
@@ -59,6 +76,7 @@ function makeHarness(trackQueue: (string | undefined)[] = ["before", "after"]) {
         { type: "message", id: "u1", parentId: "p0", message: { role: "user", content: "hi" } },
       ],
       getLeafId: () => "l9",
+      getSessionId: () => "sess-1",
     },
   };
 
@@ -100,7 +118,7 @@ test("capture: a full turn creates one checkpoint with before and after trees", 
 });
 
 test("capture: skipped snapshot (cap) records no checkpoint", async () => {
-  const h = makeHarness([undefined, undefined]);
+  const h = makeHarness({ trackQueue: [undefined, undefined] });
   await h.emit("before_agent_start", { prompt: "fix it", images: [] }, h.baseCtx);
   await h.emit(
     "message_start",
@@ -122,6 +140,7 @@ test("capture: failed pre-turn snapshot disables undo for the message", async ()
   } as unknown as Pick<ExtensionAPI, "on" | "appendEntry">;
   const store = new CheckpointStore(failingPi);
   const failing: SnapshotRepo = {
+    storeDir: "/tmp/fake-store",
     async ensure() {},
     async track() {
       throw new Error("git timed out");
@@ -131,6 +150,9 @@ test("capture: failed pre-turn snapshot disables undo for the message", async ()
     },
     async dirtySince() {
       return [];
+    },
+    async dirtySinceAll() {
+      return { manual: [], ignored: [] };
     },
     async restoreSnapshot() {
       return { skipped: [], excluded: [], manualSkipped: [] };
@@ -170,4 +192,42 @@ test("capture: failed pre-turn snapshot disables undo for the message", async ()
     notifications.some((message) => /pre-turn snapshot failed/.test(message)),
     "user is warned",
   );
+});
+
+test("capture: tool_call records write and edit paths and splits unattributed files", async () => {
+  const h = makeHarness({ changedFiles: ["a.txt", "b.txt", "c.txt"] });
+  await h.emit("before_agent_start", { prompt: "fix it", images: [] }, h.baseCtx);
+  await h.emit("message_start", { message: { role: "assistant" } }, h.baseCtx);
+  await h.emit("tool_call", { toolName: "write", input: { path: "a.txt" } }, h.baseCtx);
+  await h.emit("tool_call", { toolName: "edit", input: { path: "/tmp/somewhere/b.txt" } }, h.baseCtx);
+  await h.emit("tool_call", { toolName: "read", input: { path: "c.txt" } }, h.baseCtx);
+  await h.emit("tool_call", { toolName: "bash", input: { command: "ls" } }, h.baseCtx);
+  await h.emit("agent_settled", {}, h.baseCtx);
+
+  const checkpoint = h.store.get("u1");
+  assert.ok(checkpoint, "checkpoint exists");
+  assert.deepEqual(checkpoint.files, ["a.txt", "b.txt", "c.txt"]);
+  assert.deepEqual(checkpoint.unattributed, ["c.txt"]);
+});
+
+test("capture: touched paths are journaled, normalized, and outside paths are skipped", async () => {
+  const storeDir = await mkdtemp(path.join(tmpdir(), "pi-undo-capture-"));
+  try {
+    const h = makeHarness({ changedFiles: ["a.txt"], storeDir });
+    await h.emit("before_agent_start", { prompt: "x", images: [] }, h.baseCtx);
+    await h.emit("message_start", { message: { role: "assistant" } }, h.baseCtx);
+    await h.emit("tool_call", { toolName: "write", input: { path: "src/a.ts" } }, h.baseCtx);
+    await h.emit("tool_call", { toolName: "edit", input: { path: "/tmp/somewhere/sub/b.ts" } }, h.baseCtx);
+    await h.emit("tool_call", { toolName: "write", input: { path: "/tmp/elsewhere/c.ts" } }, h.baseCtx);
+    await h.emit("tool_call", { toolName: "read", input: { path: "ignored.txt" } }, h.baseCtx);
+    await h.emit("tool_call", { toolName: "bash", input: { command: "ls" } }, h.baseCtx);
+    await h.emit("agent_settled", {}, h.baseCtx);
+
+    const file = sessionJournalFile(storeDir, "sess-1");
+    const lines = (await readFile(file, "utf8")).trim().split("\n");
+    const paths = lines.map((line) => (JSON.parse(line) as { p: string }).p).sort();
+    assert.deepEqual(paths, ["src/a.ts", "sub/b.ts"]);
+  } finally {
+    await rm(storeDir, { recursive: true, force: true });
+  }
 });

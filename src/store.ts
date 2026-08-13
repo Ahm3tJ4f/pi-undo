@@ -134,6 +134,11 @@ function parseCheckpoint(
     files: value.files.filter(
       (file): file is string => typeof file === "string",
     ),
+    unattributed: Array.isArray(value.unattributed)
+      ? value.unattributed.filter(
+          (file): file is string => typeof file === "string",
+        )
+      : [],
     createdAt:
       typeof value.createdAt === "number" ? value.createdAt : Date.now(),
   };
