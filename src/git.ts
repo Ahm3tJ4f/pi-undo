@@ -61,8 +61,6 @@ export interface SnapshotRepo {
   track(): Promise<string | undefined>
   changedFiles(from: string, to: string): Promise<string[]>
   readonly storeDir: string
-  /** @deprecated use dirtySinceAll */
-  dirtySince(snapshot: string): Promise<string[]>
   dirtySinceAll(snapshot: string): Promise<{ manual: string[]; ignored: string[] }>
   restoreSnapshot(
     snapshot: string,
@@ -152,11 +150,6 @@ export class ShadowGit implements SnapshotRepo {
     return unique(nulSplit(result.stdout).map(normalizeGitPath).filter((f): f is string => Boolean(f)))
   }
 
-  /** @deprecated use dirtySinceAll */
-  async dirtySince(snapshot: string): Promise<string[]> {
-    return (await this.dirtyLists(snapshot)).manual
-  }
-
   async dirtySinceAll(snapshot: string): Promise<{ manual: string[]; ignored: string[] }> {
     return this.dirtyLists(snapshot)
   }
@@ -207,7 +200,7 @@ export class ShadowGit implements SnapshotRepo {
     await this.ensure()
     // Make sure info/exclude reflects the current config and large-file
     // excludes before the ignore checks below: callers do not always go
-    // through track() or dirtySince first.
+    // through track() or dirtySinceAll first.
     const meta = await this.readMeta()
     await this.syncExcludes(meta.largeExcludes ?? [])
     const rels = unique(files.map(normalizeGitPath).filter((f): f is string => Boolean(f)))

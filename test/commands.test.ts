@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 
 import type { ExtensionAPI, RegisteredCommand } from "@earendil-works/pi-coding-agent";
@@ -6,6 +9,7 @@ import type { ExtensionAPI, RegisteredCommand } from "@earendil-works/pi-coding-
 import type { CaptureDeps } from "../src/capture.ts";
 import { registerCommands } from "../src/commands.ts";
 import type { SnapshotRepo } from "../src/git.ts";
+import { appendTouches } from "../src/journal.ts";
 import { CheckpointStore } from "../src/store.ts";
 import type { Checkpoint } from "../src/types.ts";
 import type { NumstatRow } from "../src/util.ts";
@@ -15,6 +19,7 @@ interface FakeUi {
   editorText: string | undefined;
   confirmCalls: { title: string; message: string }[];
   confirmResult: boolean;
+  confirmQueue: boolean[];
   notify: (message: string, level?: string) => void;
   confirm: (title: string, message: string) => Promise<boolean>;
   setEditorText: (text: string) => void;
@@ -26,11 +31,13 @@ function makeUi(): FakeUi {
     editorText: undefined,
     confirmCalls: [],
     confirmResult: true,
+    confirmQueue: [],
     notify(message) {
       this.notifications.push(message);
     },
     async confirm(title, message) {
       this.confirmCalls.push({ title, message });
+      if (this.confirmQueue.length > 0) return this.confirmQueue.shift()!;
       return this.confirmResult;
     },
     setEditorText(text) {
@@ -57,13 +64,16 @@ function makeEntry(
   };
 }
 
-function makeRepo(): {
+function makeRepo(storeDir = "/tmp/fake-store"): {
   repo: SnapshotRepo;
   state: {
     calls: string[];
     dirty: string[];
+    ignored: string[];
     verify: (snapshot: string) => boolean;
     numstat: NumstatRow[];
+    skipped: string[];
+    excluded: string[];
     manualSkipped: string[];
     restoreOpts: ({ manualSet?: ReadonlySet<string>; force?: boolean } | undefined)[];
   };
@@ -71,13 +81,16 @@ function makeRepo(): {
   const state = {
     calls: [] as string[],
     dirty: [] as string[],
+    ignored: [] as string[],
     verify: (_snapshot: string) => true,
     numstat: [] as NumstatRow[],
+    skipped: [] as string[],
+    excluded: [] as string[],
     manualSkipped: [] as string[],
     restoreOpts: [] as ({ manualSet?: ReadonlySet<string>; force?: boolean } | undefined)[],
   };
   const repo: SnapshotRepo = {
-    storeDir: "/tmp/fake-store",
+    storeDir,
     async ensure() {},
     async track() {
       state.calls.push("track");
@@ -87,18 +100,14 @@ function makeRepo(): {
       state.calls.push("changedFiles");
       return [];
     },
-    async dirtySince() {
-      state.calls.push("dirtySince");
-      return state.dirty;
-    },
     async dirtySinceAll() {
       state.calls.push("dirtySinceAll");
-      return { manual: state.dirty, ignored: [] };
+      return { manual: state.dirty, ignored: state.ignored };
     },
     async restoreSnapshot(_snapshot, files, _since, opts) {
       state.calls.push(`restore:${_snapshot}:${files.join(",")}`);
       state.restoreOpts.push(opts);
-      return { skipped: [], excluded: [], manualSkipped: state.manualSkipped };
+      return { skipped: state.skipped, excluded: state.excluded, manualSkipped: state.manualSkipped };
     },
     async verifySnapshot(snapshot) {
       state.calls.push(`verify:${snapshot}`);
@@ -131,7 +140,7 @@ function makeCheckpoint(overrides: Partial<Checkpoint> = {}): Checkpoint {
   };
 }
 
-function setup() {
+function setup(repoState = makeRepo()) {
   const appended: unknown[] = [];
   const handlers = new Map<string, Omit<RegisteredCommand, "name" | "sourceInfo">>();
   const fakePi: Pick<ExtensionAPI, "appendEntry" | "registerCommand"> = {
@@ -139,7 +148,6 @@ function setup() {
     registerCommand: (name, opts) => void handlers.set(name, opts),
   };
   const store = new CheckpointStore(fakePi);
-  const repoState = makeRepo();
   const deps: CaptureDeps = { getGit: () => repoState.repo };
   registerCommands(fakePi, store, deps);
   return {
@@ -166,7 +174,7 @@ function sessionCtx(
     isIdle: () => opts.idle ?? true,
     abort: () => {},
     waitForIdle: async () => {},
-    sessionManager: { getBranch: () => branch },
+    sessionManager: { getBranch: () => branch, getSessionId: () => "self-session" },
     navigateTree: async (target: string) => {
       navigations.push({ target });
       if (opts.navigateError) throw new Error(opts.navigateError);
@@ -216,7 +224,7 @@ test("undo: dirty guard blocks when manual edits exist and user declines", async
   assert.match(ui.confirmCalls[0]!.message, /a\.txt/);
   assert.doesNotMatch(ui.confirmCalls[0]!.message, /b\.txt/);
   assert.deepEqual(navigations, []);
-  assert.deepEqual(repoState.state.calls, ["dirtySince"]);
+  assert.deepEqual(repoState.state.calls, ["dirtySinceAll"]);
 });
 
 test("undo: dirty guard shows the preview and restores after force", async () => {
@@ -273,7 +281,7 @@ test("undo: cancel before restore leaves everything untouched", async () => {
   ui.confirmResult = false;
   await run("undo", ctx);
   assert.deepEqual(navigations, []);
-  assert.deepEqual(repoState.state.calls, ["dirtySince", "diffNumstat"]);
+  assert.deepEqual(repoState.state.calls, ["dirtySinceAll", "diffNumstat"]);
   assert.equal(ui.editorText, undefined);
 });
 
@@ -418,17 +426,31 @@ test("redo: verify failure rolls the files back and does not navigate", async ()
   assert.match(ui.notifications[0]!, /roll/);
 });
 
-test("redo: blocked by the dirty guard", async () => {
+test("redo: dirty guard dialog blocks when the user declines", async () => {
   const { store, repoState, run } = setup();
   store.add(makeCheckpoint({}));
   store.markReverted(store.get("u1")!);
   repoState.state.dirty = ["a.txt"];
   const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  ui.confirmResult = false;
   await run("redo", ctx);
   assert.match(ui.notifications[0]!, /blocked/);
-  assert.match(ui.notifications[0]!, /a\.txt/);
+  assert.match(ui.confirmCalls[0]!.message, /a\.txt/);
   assert.deepEqual(navigations, []);
   assert.equal(store.peekReverted()?.userEntryId, "u1", "still reverted");
+});
+
+test("redo: dirty guard dialog forces the restore on confirm", async () => {
+  const { store, repoState, run } = setup();
+  store.add(makeCheckpoint({}));
+  store.markReverted(store.get("u1")!);
+  repoState.state.dirty = ["a.txt"];
+  const { ctx, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  await run("redo", ctx);
+  assert.deepEqual(navigations, [{ target: "l3" }]);
+  assert.ok(repoState.state.calls.includes("restore:after1:a.txt"));
+  assert.equal(repoState.state.restoreOpts[0]?.force, true);
+  assert.equal(store.peekReverted(), undefined, "redo stack is popped");
 });
 
 test("redo: manual edits in files the message did not change do not block", async () => {
@@ -548,4 +570,132 @@ test("store: two undos in a row target the previous message", async () => {
   // After undoing u2 the branch no longer contains it.
   const branchAfterFirst = branchBoth.slice(0, 2);
   assert.equal(store.latestOnBranch(branchAfterFirst as never)?.userEntryId, "u1");
+});
+
+test("undo: gitignored manual edits trigger the dialog and force the restore", async () => {
+  const { store, repoState, run } = setup();
+  store.add(makeCheckpoint({ files: ["a.txt", "x.log"] }));
+  // x.log is gitignored and has manual edits since the message. a.txt is clean.
+  repoState.state.ignored = ["x.log"];
+  const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  await run("undo", ctx);
+  assert.equal(ui.confirmCalls[0]!.title, "Manual edits found");
+  assert.match(ui.confirmCalls[0]!.message, /x\.log/);
+  assert.doesNotMatch(ui.confirmCalls[0]!.message, /a\.txt/);
+  // Confirm forces the restore so x.log is not silently skipped.
+  assert.equal(repoState.state.restoreOpts[0]?.force, true);
+  assert.ok(repoState.state.calls.includes("restore:before1:a.txt,x.log"));
+  assert.deepEqual(navigations, [{ target: "l0" }]);
+});
+
+test("undo: declining the gitignored manual-edit dialog blocks undo", async () => {
+  const { store, repoState, run } = setup();
+  store.add(makeCheckpoint({ files: ["a.txt", "x.log"] }));
+  repoState.state.ignored = ["x.log"];
+  const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  ui.confirmResult = false;
+  await run("undo", ctx);
+  assert.match(ui.notifications[0]!, /Undo blocked/);
+  assert.deepEqual(navigations, []);
+  assert.deepEqual(repoState.state.calls, ["dirtySinceAll"]);
+});
+
+test("undo: unattributed files are skipped when the user declines", async () => {
+  const storeDir = path.join(tmpdir(), `pi-undo-nojournal-${process.pid}-${Math.random().toString(36).slice(2)}`);
+  const { store, repoState, run } = setup(makeRepo(storeDir));
+  store.add(makeCheckpoint({ files: ["a.txt", "b.txt"], unattributed: ["b.txt"] }));
+  const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  // Main dialog yes, unattributed dialog no.
+  ui.confirmQueue = [true, false];
+  await run("undo", ctx);
+  assert.ok(repoState.state.calls.includes("restore:before1:a.txt"));
+  assert.ok(!repoState.state.calls.includes("restore:before1:a.txt,b.txt"));
+  assert.ok(!repoState.state.calls.includes("restore:before1:b.txt"));
+  assert.deepEqual(navigations, [{ target: "l0" }]);
+  assert.ok(
+    ui.notifications.some((m) => /not edited by this session/.test(m)),
+    "declined unattributed files get a note",
+  );
+});
+
+test("undo: unattributed files are restored when the user confirms", async () => {
+  const storeDir = path.join(tmpdir(), `pi-undo-nojournal-${process.pid}-${Math.random().toString(36).slice(2)}`);
+  const { store, repoState, run } = setup(makeRepo(storeDir));
+  store.add(makeCheckpoint({ files: ["a.txt", "b.txt"], unattributed: ["b.txt"] }));
+  const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  ui.confirmQueue = [true, true];
+  await run("undo", ctx);
+  assert.ok(repoState.state.calls.includes("restore:before1:a.txt,b.txt"));
+  assert.deepEqual(navigations, [{ target: "l0" }]);
+  assert.equal(ui.confirmCalls.some((c) => c.title === "Unattributed changes"), true);
+});
+
+test("undo: other-session files are never restored and the session is named", async () => {
+  const storeDir = await mkdtemp(path.join(tmpdir(), "pi-undo-commands-"));
+  try {
+    await appendTouches(storeDir, "other-session", ["b.txt"]);
+    const { store, repoState, run } = setup(makeRepo(storeDir));
+    store.add(makeCheckpoint({ files: ["a.txt", "b.txt"], unattributed: ["b.txt"] }));
+    const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
+    await run("undo", ctx);
+    assert.ok(repoState.state.calls.includes("restore:before1:a.txt"));
+    assert.ok(!repoState.state.calls.includes("restore:before1:b.txt"));
+    assert.ok(!repoState.state.calls.includes("restore:before1:a.txt,b.txt"));
+    assert.ok(
+      ui.notifications.some((m) => /other-session/.test(m)),
+      "the other session id appears in a note",
+    );
+    assert.deepEqual(navigations, [{ target: "l0" }]);
+  } finally {
+    await rm(storeDir, { recursive: true, force: true });
+  }
+});
+
+test("undo: journal read failure treats unattributed files as unknown", async () => {
+  // A store dir that cannot be read: attributeTouches fails, so every
+  // unattributed file is unknown and the unattributed dialog is shown.
+  const storeDir = path.join(tmpdir(), `pi-undo-missing-${process.pid}`);
+  const { store, repoState, run } = setup(makeRepo(storeDir));
+  store.add(makeCheckpoint({ files: ["a.txt"], unattributed: ["a.txt"] }));
+  const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  ui.confirmQueue = [true, false];
+  await run("undo", ctx);
+  assert.equal(ui.confirmCalls.some((c) => c.title === "Unattributed changes"), true);
+  assert.ok(!ui.notifications.some((m) => /other pi sessions/.test(m)));
+  // No restore ran: the only file was declined in the unattributed dialog.
+  assert.ok(!repoState.state.calls.some((c) => c.startsWith("restore:")));
+  assert.deepEqual(navigations, [{ target: "l0" }]);
+});
+
+test("undo: restored count subtracts skipped and excluded files", async () => {
+  const { store, repoState, run } = setup();
+  store.add(makeCheckpoint({ files: ["a.txt", "b.txt", "c.txt"] }));
+  repoState.state.skipped = ["b.txt"];
+  repoState.state.excluded = ["c.txt"];
+  const { ctx, ui } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  await run("undo", ctx);
+  assert.equal(ui.notifications[0], "Undid message, restored 1 file(s)");
+});
+
+test("diff: splits edited and unattributed files and marks other sessions", async () => {
+  const storeDir = await mkdtemp(path.join(tmpdir(), "pi-undo-commands-"));
+  try {
+    await appendTouches(storeDir, "other-session", ["b.txt"]);
+    const { store, repoState, run } = setup(makeRepo(storeDir));
+    store.add(makeCheckpoint({ files: ["a.txt", "b.txt", "c.txt"], unattributed: ["b.txt", "c.txt"] }));
+    repoState.state.numstat = [
+      { file: "a.txt", added: 1, removed: 0 },
+      { file: "b.txt", added: 2, removed: 0 },
+      { file: "c.txt", added: 3, removed: 0 },
+    ];
+    const { ctx, ui } = sessionCtx([makeEntry("u1", "user", "l0")]);
+    await run("diff", ctx);
+    const message = ui.notifications[0]!;
+    assert.match(message, /Changes made by the last message/);
+    assert.match(message, /a\.txt/);
+    assert.match(message, /b\.txt \(session other-session\)/);
+    assert.match(message, /Changed during the message by other sources/);
+  } finally {
+    await rm(storeDir, { recursive: true, force: true });
+  }
 });

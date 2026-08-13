@@ -22,7 +22,9 @@ interface HarnessOptions {
 function makeHarness(options: HarnessOptions = {}) {
   const trackQueue = options.trackQueue ?? ["before", "after"];
   const changedFilesResult = options.changedFiles ?? ["a.txt"];
-  const storeDir = options.storeDir ?? "/tmp/fake-store";
+  const storeDir =
+    options.storeDir ??
+    path.join(tmpdir(), `pi-undo-capture-${process.pid}-${Math.random().toString(36).slice(2)}`);
   const handlers = new Map<string, Handler>();
   const fakePi = {
     on: (event: string, handler: Handler) => void handlers.set(event, handler),
@@ -42,9 +44,6 @@ function makeHarness(options: HarnessOptions = {}) {
     async changedFiles(from, to) {
       calls.push(`changedFiles:${from}:${to}`);
       return changedFilesResult;
-    },
-    async dirtySince() {
-      return [];
     },
     async dirtySinceAll() {
       return { manual: [], ignored: [] };
@@ -146,9 +145,6 @@ test("capture: failed pre-turn snapshot disables undo for the message", async ()
       throw new Error("git timed out");
     },
     async changedFiles() {
-      return [];
-    },
-    async dirtySince() {
       return [];
     },
     async dirtySinceAll() {
