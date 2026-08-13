@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -8,11 +9,13 @@ import type { ExtensionAPI, RegisteredCommand } from "@earendil-works/pi-coding-
 
 import type { CaptureDeps } from "../src/capture.ts";
 import { registerCommands } from "../src/commands.ts";
-import type { SnapshotRepo } from "../src/git.ts";
+import { ShadowGit, type SnapshotRepo } from "../src/git.ts";
 import { appendTouches } from "../src/journal.ts";
 import { CheckpointStore } from "../src/store.ts";
 import type { Checkpoint } from "../src/types.ts";
 import type { NumstatRow } from "../src/util.ts";
+
+process.env.PI_UNDO_STORE_ROOT = path.join(tmpdir(), `pi-undo-commands-store-${process.pid}`);
 
 interface FakeUi {
   notifications: string[];
@@ -75,7 +78,8 @@ function makeRepo(storeDir = "/tmp/fake-store"): {
     skipped: string[];
     excluded: string[];
     manualSkipped: string[];
-    restoreOpts: ({ manualSet?: ReadonlySet<string>; force?: boolean } | undefined)[];
+    restoreOpts: ({ manualSet?: ReadonlySet<string>; force?: boolean; verifyExclude?: string[] } | undefined)[];
+    verifyExcludes: string[][];
   };
 } {
   const state = {
@@ -87,7 +91,8 @@ function makeRepo(storeDir = "/tmp/fake-store"): {
     skipped: [] as string[],
     excluded: [] as string[],
     manualSkipped: [] as string[],
-    restoreOpts: [] as ({ manualSet?: ReadonlySet<string>; force?: boolean } | undefined)[],
+    restoreOpts: [] as ({ manualSet?: ReadonlySet<string>; force?: boolean; verifyExclude?: string[] } | undefined)[],
+    verifyExcludes: [] as string[][],
   };
   const repo: SnapshotRepo = {
     storeDir,
@@ -109,8 +114,9 @@ function makeRepo(storeDir = "/tmp/fake-store"): {
       state.restoreOpts.push(opts);
       return { skipped: state.skipped, excluded: state.excluded, manualSkipped: state.manualSkipped };
     },
-    async verifySnapshot(snapshot) {
+    async verifySnapshot(snapshot, exclude) {
       state.calls.push(`verify:${snapshot}`);
+      state.verifyExcludes.push(exclude ?? []);
       return state.verify(snapshot);
     },
     async diffNumstat() {
@@ -617,6 +623,9 @@ test("undo: unattributed files are skipped when the user declines", async () => 
     ui.notifications.some((m) => /not edited by this session/.test(m)),
     "declined unattributed files get a note",
   );
+  // The declined b.txt is left in the shadow index, so the verify must
+  // exclude it or the restore would roll back.
+  assert.ok(repoState.state.verifyExcludes[0]?.includes("b.txt"));
 });
 
 test("undo: unattributed files are restored when the user confirms", async () => {
@@ -646,7 +655,28 @@ test("undo: other-session files are never restored and the session is named", as
       ui.notifications.some((m) => /other-session/.test(m)),
       "the other session id appears in a note",
     );
+    // b.txt is still in the shadow index at its after state, so the undo
+    // verify must exclude it or verification fails and the restore rolls back.
+    assert.ok(repoState.state.verifyExcludes[0]?.includes("b.txt"));
     assert.deepEqual(navigations, [{ target: "l0" }]);
+  } finally {
+    await rm(storeDir, { recursive: true, force: true });
+  }
+});
+
+test("redo: verify excludes other-session files left in the index", async () => {
+  const storeDir = await mkdtemp(path.join(tmpdir(), "pi-undo-commands-"));
+  try {
+    await appendTouches(storeDir, "other-session", [{ p: "b.txt", t: 100 }]);
+    const { store, repoState, run } = setup(makeRepo(storeDir));
+    store.add(makeCheckpoint({ files: ["a.txt", "b.txt"], unattributed: ["b.txt"], startedAt: 50, createdAt: 150 }));
+    store.markReverted(store.get("u1")!);
+    const { ctx, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
+    await run("redo", ctx);
+    assert.ok(repoState.state.calls.includes("restore:after1:a.txt"));
+    assert.ok(!repoState.state.calls.includes("restore:after1:a.txt,b.txt"));
+    assert.ok(repoState.state.verifyExcludes[0]?.includes("b.txt"));
+    assert.deepEqual(navigations, [{ target: "l3" }]);
   } finally {
     await rm(storeDir, { recursive: true, force: true });
   }
@@ -748,4 +778,85 @@ test("undo: a file that equals the undo target is exempt from the manual-edit pr
   );
   assert.ok(repoState.state.calls.includes("restore:before1:a.txt"));
   assert.ok(!repoState.state.calls.includes("restore:before1:a.txt,b.txt"));
+});
+
+function fakeExec(): (command: string, args: string[], options?: { cwd?: string; timeout?: number }) => Promise<{
+  stdout: string;
+  stderr: string;
+  code: number;
+  killed: boolean;
+}> {
+  return (command, args, options) =>
+    new Promise((resolve) => {
+      execFile(command, args, { cwd: options?.cwd, timeout: options?.timeout }, (error, stdout, stderr) => {
+        const raw = error as { code?: number | string } | null;
+        const code = typeof raw?.code === "number" ? raw.code : error ? 1 : 0;
+        resolve({ stdout: String(stdout), stderr: String(stderr), code, killed: false });
+      });
+    });
+}
+
+test("undo: real git verifies correctly when another session's file is left in the index", async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), "pi-undo-undo-it-"));
+  try {
+    await writeFile(path.join(cwd, "a.txt"), "one\n");
+    const git = new ShadowGit({ exec: fakeExec() }, cwd);
+    await git.ensure();
+    const before = await git.track();
+    assert.ok(before, "before snapshot exists");
+
+    // The message edits a.txt. Another pi session creates b.txt during it.
+    await writeFile(path.join(cwd, "a.txt"), "one\nchanged\n");
+    await writeFile(path.join(cwd, "b.txt"), "other session\n");
+    const after = await git.track();
+    assert.ok(after, "after snapshot exists");
+
+    // The other session's touch on b.txt falls inside the message window.
+    await appendTouches(git.storeDir, "other-session", [{ p: "b.txt", t: 100 }]);
+
+    const appended: unknown[] = [];
+    const handlers = new Map<string, Omit<RegisteredCommand, "name" | "sourceInfo">>();
+    const fakePi: Pick<ExtensionAPI, "appendEntry" | "registerCommand"> = {
+      appendEntry: (_type, data) => void appended.push(data),
+      registerCommand: (name, opts) => void handlers.set(name, opts),
+    };
+    const store = new CheckpointStore(fakePi);
+    store.add({
+      userEntryId: "u1",
+      beforeLeafId: "l0",
+      finalLeafId: "l3",
+      prompt: "change a",
+      imageCount: 0,
+      beforeSnapshot: before,
+      afterSnapshot: after,
+      files: ["a.txt", "b.txt"],
+      unattributed: ["b.txt"],
+      startedAt: 50,
+      createdAt: 150,
+    });
+    const deps: CaptureDeps = { getGit: () => git };
+    registerCommands(fakePi, store, deps);
+
+    const ui = makeUi();
+    const ctx = {
+      ui,
+      isIdle: () => true,
+      abort: () => {},
+      waitForIdle: async () => {},
+      sessionManager: {
+        getBranch: () => [makeEntry("u1", "user", "l0")],
+        getSessionId: () => "self-session",
+      },
+      navigateTree: async () => ({ cancelled: false }),
+    };
+    await (handlers.get("undo")!.handler as (args: string, ctx: unknown) => Promise<void>)("", ctx);
+
+    // a.txt is restored; the other session's b.txt is left untouched.
+    assert.equal(await readFile(path.join(cwd, "a.txt"), "utf8"), "one\n");
+    assert.equal(await readFile(path.join(cwd, "b.txt"), "utf8"), "other session\n");
+    assert.match(ui.notifications[0]!, /^Undid message/);
+    assert.ok(!ui.notifications.some((m) => /rolled back/.test(m)));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
 });

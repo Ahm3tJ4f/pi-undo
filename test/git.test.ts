@@ -118,6 +118,33 @@ test("tracks, diffs and verifies in a non-git directory", async () => {
   }
 });
 
+test("verifySnapshot excludes files deliberately left in the index", async () => {
+  const dir = await newTempDir("pi-undo-verify-exclude-");
+  try {
+    await writeFile(path.join(dir, "a.txt"), "one\n");
+    const git = await newShadow(dir);
+    const before = await tracked(git);
+
+    await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
+    await writeFile(path.join(dir, "b.txt"), "other session\n");
+    const after = await tracked(git);
+
+    // Restore only a.txt; b.txt (another session's file) stays in the index
+    // at its after state.
+    await git.restoreSnapshot(before, ["a.txt"], after);
+    assert.equal(await readFile(path.join(dir, "a.txt"), "utf8"), "one\n");
+    assert.equal(await readFile(path.join(dir, "b.txt"), "utf8"), "other session\n");
+
+    // b.txt is still in the index but not in the before tree, so the
+    // full-tree verify fails.
+    assert.equal(await git.verifySnapshot(before), false);
+    // Excluding the deliberately-left-out file makes the verify pass.
+    assert.equal(await git.verifySnapshot(before, ["b.txt"]), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("gitignored files edited during the turn are snapshotted and undoable", async () => {
   const dir = await newTempDir("pi-undo-ignore-");
   try {

@@ -17,6 +17,7 @@ interface AttributionGroups {
   editedFiles: string[]
   unknownFiles: string[]
   otherSession: string[]
+  otherSessionFiles: string[]
 }
 
 // Returns the message files that would be clobbered by a restore to `target`.
@@ -44,10 +45,15 @@ async function restoreFiles(
   target: string,
   files: string[],
   since?: string,
-  opts?: { manualSet?: ReadonlySet<string>; force?: boolean },
+  opts?: { manualSet?: ReadonlySet<string>; force?: boolean; verifyExclude?: string[] },
 ): Promise<RestoreOutcome> {
   const { skipped, excluded, manualSkipped } = await git.restoreSnapshot(target, files, since, opts)
-  const ok = await git.verifySnapshot(target, [...skipped, ...excluded, ...manualSkipped])
+  const ok = await git.verifySnapshot(target, [
+    ...skipped,
+    ...excluded,
+    ...manualSkipped,
+    ...(opts?.verifyExclude ?? []),
+  ])
   return { ok, skipped, excluded, manualSkipped }
 }
 
@@ -102,14 +108,13 @@ async function splitFiles(
       attributed = new Map()
     }
   }
-  const otherSession = unattributed
-    .filter((file) => attributed.has(file))
-    .map((file) => {
-      const sessions = attributed.get(file) ?? []
-      return `${file} (session ${sessions.join(", ")})`
-    })
+  const otherSessionFiles = unattributed.filter((file) => attributed.has(file))
+  const otherSession = otherSessionFiles.map((file) => {
+    const sessions = attributed.get(file) ?? []
+    return `${file} (session ${sessions.join(", ")})`
+  })
   const unknownFiles = unattributed.filter((file) => !attributed.has(file))
-  return { editedFiles, unknownFiles, otherSession }
+  return { editedFiles, unknownFiles, otherSession, otherSessionFiles }
 }
 
 export function registerCommands(
@@ -236,9 +241,16 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
         filesToRestore = groups.editedFiles
       }
 
+      // Files deliberately left alone (declined unknowns, other-session files)
+      // still sit in the shadow index at their after state. Verification
+      // compares the index to the target snapshot, so exclude them from the
+      // check or a correct restore fails verification and rolls back.
+      const leftOut = [...unknownDeclined, ...groups.otherSessionFiles]
+
       if (filesToRestore.length > 0) {
         outcome = await restoreFiles(git, changes.before, filesToRestore, changes.after, {
           force: manualInMessage.length > 0,
+          verifyExclude: leftOut,
         })
         if (!outcome.ok) {
           const rolledBack = await rollbackFiles(git, changes.after, filesToRestore, outcome)
@@ -404,9 +416,16 @@ async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
         filesToRestore = groups.editedFiles
       }
 
+      // Files deliberately left alone (declined unknowns, other-session files)
+      // still sit in the shadow index at their after state. Verification
+      // compares the index to the target snapshot, so exclude them from the
+      // check or a correct restore fails verification and rolls back.
+      const leftOut = [...unknownDeclined, ...groups.otherSessionFiles]
+
       if (filesToRestore.length > 0) {
         outcome = await restoreFiles(git, changes.after, filesToRestore, changes.before, {
           force: manualInMessage.length > 0,
+          verifyExclude: leftOut,
         })
         if (!outcome.ok) {
           const rolledBack = await rollbackFiles(git, changes.before, filesToRestore, outcome)
