@@ -607,37 +607,28 @@ test("undo: declining the gitignored manual-edit dialog blocks undo", async () =
   assert.deepEqual(repoState.state.calls, ["dirtySinceAll", "dirtySinceAll"]);
 });
 
-test("undo: unattributed files are skipped when the user declines", async () => {
+test("undo: unattributed files are never restored and are warned about in the dialog", async () => {
   const storeDir = path.join(tmpdir(), `pi-undo-nojournal-${process.pid}-${Math.random().toString(36).slice(2)}`);
   const { store, repoState, run } = setup(makeRepo(storeDir));
   store.add(makeCheckpoint({ files: ["a.txt", "b.txt"], unattributed: ["b.txt"] }));
   const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
-  // Main dialog yes, unattributed dialog no.
-  ui.confirmQueue = [true, false];
   await run("undo", ctx);
+  // One dialog only: no second "restore them too?" question.
+  assert.equal(ui.confirmCalls.length, 1);
+  assert.equal(ui.confirmCalls[0]!.title, "Undo message");
+  assert.match(ui.confirmCalls[0]!.message, /not restored/);
+  assert.match(ui.confirmCalls[0]!.message, /b\.txt/);
   assert.ok(repoState.state.calls.includes("restore:before1:a.txt"));
   assert.ok(!repoState.state.calls.includes("restore:before1:a.txt,b.txt"));
   assert.ok(!repoState.state.calls.includes("restore:before1:b.txt"));
   assert.deepEqual(navigations, [{ target: "l0" }]);
   assert.ok(
     ui.notifications.some((m) => /not edited by this session/.test(m)),
-    "declined unattributed files get a note",
+    "unattributed files get a note",
   );
-  // The declined b.txt is left in the shadow index, so the verify must
-  // exclude it or the restore would roll back.
+  // b.txt is left in the shadow index, so the verify must exclude it or
+  // the restore would roll back.
   assert.ok(repoState.state.verifyExcludes[0]?.includes("b.txt"));
-});
-
-test("undo: unattributed files are restored when the user confirms", async () => {
-  const storeDir = path.join(tmpdir(), `pi-undo-nojournal-${process.pid}-${Math.random().toString(36).slice(2)}`);
-  const { store, repoState, run } = setup(makeRepo(storeDir));
-  store.add(makeCheckpoint({ files: ["a.txt", "b.txt"], unattributed: ["b.txt"] }));
-  const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
-  ui.confirmQueue = [true, true];
-  await run("undo", ctx);
-  assert.ok(repoState.state.calls.includes("restore:before1:a.txt,b.txt"));
-  assert.deepEqual(navigations, [{ target: "l0" }]);
-  assert.equal(ui.confirmCalls.some((c) => c.title === "Unattributed changes"), true);
 });
 
 test("undo: other-session files are never restored and the session is named", async () => {
@@ -648,6 +639,8 @@ test("undo: other-session files are never restored and the session is named", as
     store.add(makeCheckpoint({ files: ["a.txt", "b.txt"], unattributed: ["b.txt"], startedAt: 50, createdAt: 150 }));
     const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
     await run("undo", ctx);
+    assert.equal(ui.confirmCalls.length, 1);
+    assert.match(ui.confirmCalls[0]!.message, /not restored/);
     assert.ok(repoState.state.calls.includes("restore:before1:a.txt"));
     assert.ok(!repoState.state.calls.includes("restore:before1:b.txt"));
     assert.ok(!repoState.state.calls.includes("restore:before1:a.txt,b.txt"));
@@ -684,16 +677,16 @@ test("redo: verify excludes other-session files left in the index", async () => 
 
 test("undo: journal read failure treats unattributed files as unknown", async () => {
   // A store dir that cannot be read: attributeTouches fails, so every
-  // unattributed file is unknown and the unattributed dialog is shown.
+  // unattributed file is unknown, warned about, and left alone.
   const storeDir = path.join(tmpdir(), `pi-undo-missing-${process.pid}`);
   const { store, repoState, run } = setup(makeRepo(storeDir));
   store.add(makeCheckpoint({ files: ["a.txt"], unattributed: ["a.txt"] }));
   const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
-  ui.confirmQueue = [true, false];
   await run("undo", ctx);
-  assert.equal(ui.confirmCalls.some((c) => c.title === "Unattributed changes"), true);
+  assert.equal(ui.confirmCalls.length, 1);
+  assert.match(ui.confirmCalls[0]!.message, /not restored/);
   assert.ok(!ui.notifications.some((m) => /other pi sessions/.test(m)));
-  // No restore ran: the only file was declined in the unattributed dialog.
+  // No restore ran: the only file is unattributed and never restored.
   assert.ok(!repoState.state.calls.some((c) => c.startsWith("restore:")));
   assert.deepEqual(navigations, [{ target: "l0" }]);
 });
@@ -740,16 +733,14 @@ test("undo then redo does not show a spurious manual-edit prompt for a declined 
     snapshot === "before1" ? { manual: ["b.txt"], ignored: [] } : { manual: [], ignored: [] };
   store.add(makeCheckpoint({ files: ["a.txt", "b.txt"], unattributed: ["b.txt"] }));
 
-  // Undo: main dialog yes, unattributed dialog no, so b.txt stays at after1.
+  // Undo: one dialog, b.txt is unattributed and stays at after1.
   const undo = sessionCtx([makeEntry("u1", "user", "l0")]);
-  undo.ui.confirmQueue = [true, false];
   await run("undo", undo.ctx);
   assert.ok(repoState.state.calls.includes("restore:before1:a.txt"));
   assert.ok(!repoState.state.calls.includes("restore:before1:a.txt,b.txt"));
 
   // Redo must not ask about manual edits: b.txt already equals the target.
   const redo = sessionCtx([makeEntry("u1", "user", "l0")]);
-  redo.ui.confirmQueue = [true, false];
   await run("redo", redo.ctx);
   assert.equal(
     redo.ui.confirmCalls.some((c) => c.title === "Manual edits found"),
@@ -769,7 +760,6 @@ test("undo: a file that equals the undo target is exempt from the manual-edit pr
   store.add(makeCheckpoint({ files: ["a.txt", "b.txt"], unattributed: ["b.txt"] }));
 
   const { ctx, ui } = sessionCtx([makeEntry("u1", "user", "l0")]);
-  ui.confirmQueue = [true, false];
   await run("undo", ctx);
   assert.equal(
     ui.confirmCalls.some((c) => c.title === "Manual edits found"),

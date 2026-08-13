@@ -75,11 +75,14 @@ The journal is best effort. A missing or broken file is ignored.
 The undo flow gains three groups:
 
 - **Edited by this session.** Restored.
-- **Unattributed.** The dialog asks: "Also restore these?" The default
-  is no. The default is safe: a missed undo is annoying, but restoring
-  another agent's work is data loss.
-- **Touched by another pi session.** Never restored. A note shows the
-  session id.
+- **Unattributed.** Never restored. The dialog lists them as a warning.
+  The default is safe: a missed undo is annoying, but restoring another
+  agent's work is data loss.
+- **Touched by another pi session.** Never restored. The warning shows
+  the session id.
+
+One dialog only. There is no second question about the unattributed
+files.
 
 The manual-edit prompt now covers gitignored files too. If the user
 confirms, the restore overwrites the manual edits. If the user declines,
@@ -173,13 +176,11 @@ Add to `DEFAULT_EXCLUDE_DIRECTORIES`:
    check covers tracked and gitignored files. When it finds any, show
    the prompt. Decline blocks the undo.
 2. Compute the three groups: edited, unattributed, other-session.
-3. Show the main dialog. It lists the edited files and notes the other
-   groups.
-4. When unattributed files exist, ask: "Also restore them?" Yes
-   restores them. No leaves them.
-5. Restore the chosen files. Verify. Roll back on failure with the
+3. Show one dialog. It lists the edited files. It warns about the
+   unattributed and other-session files. They are never restored.
+4. Restore the edited files. Verify. Roll back on failure with the
    original skip lists.
-6. After success, show notes for skipped, excluded, and other-session
+5. After success, show notes for skipped, excluded, and other-session
    files.
 
 `/redo` mirrors this flow with the after snapshot as the target.

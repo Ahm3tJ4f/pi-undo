@@ -179,7 +179,7 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
   let excluded: string[] = []
   let manualSkipped: string[] = []
   let filesToRestore: string[] = []
-  let unknownDeclined: string[] = []
+  let unknownLeft: string[] = []
   let otherSession: string[] = []
   let outcome: RestoreOutcome | null = null
   let didRestore = false
@@ -213,12 +213,15 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
         20,
         stats.binaryCount,
       )
-      let message = `${preview}\n\nRestore files to the state before this message?`
+      let message =
+        groups.editedFiles.length === 0
+          ? `This session did not edit any of the changed files with its file tools.\n\nRestore files to the state before this message?`
+          : `${preview}\n\nRestore files to the state before this message?`
       if (groups.unknownFiles.length > 0) {
-        message += `\n\nAlso changed during the message, not by this session's file tools:\n${formatList(groups.unknownFiles)}`
+        message += `\n\nChanged during the message by other sources, not restored:\n${formatList(groups.unknownFiles)}`
       }
       if (otherSession.length > 0) {
-        message += `\n\nEdited by other pi sessions, never restored:\n${formatList(otherSession)}`
+        message += `\n\nEdited by other pi sessions, not restored:\n${formatList(otherSession)}`
       }
       const ok = await ctx.ui.confirm("Undo message", message)
       if (!ok) {
@@ -226,26 +229,16 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
         return
       }
 
-      if (groups.unknownFiles.length > 0) {
-        const restoreUnknown = await ctx.ui.confirm(
-          "Unattributed changes",
-          `These changed during the message but this session's file tools did not edit them. Restore them too?\n\n${formatList(groups.unknownFiles)}`,
-        )
-        if (restoreUnknown) {
-          filesToRestore = [...groups.editedFiles, ...groups.unknownFiles]
-        } else {
-          filesToRestore = groups.editedFiles
-          unknownDeclined = groups.unknownFiles
-        }
-      } else {
-        filesToRestore = groups.editedFiles
-      }
+      // Files this session did not touch are never restored. The dialog
+      // above warns about them; they are left alone.
+      filesToRestore = groups.editedFiles
+      unknownLeft = groups.unknownFiles
 
-      // Files deliberately left alone (declined unknowns, other-session files)
+      // Files deliberately left alone (unattributed and other-session files)
       // still sit in the shadow index at their after state. Verification
       // compares the index to the target snapshot, so exclude them from the
       // check or a correct restore fails verification and rolls back.
-      const leftOut = [...unknownDeclined, ...groups.otherSessionFiles]
+      const leftOut = [...unknownLeft, ...groups.otherSessionFiles]
 
       if (filesToRestore.length > 0) {
         outcome = await restoreFiles(git, changes.before, filesToRestore, changes.after, {
@@ -324,9 +317,9 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
         "warning",
       )
     }
-    if (unknownDeclined.length > 0) {
+    if (unknownLeft.length > 0) {
       ctx.ui.notify(
-        `Note: ${unknownDeclined.length} file(s) changed during the message but were not edited by this session; left alone: ${listPaths(unknownDeclined)}`,
+        `Note: ${unknownLeft.length} file(s) changed during the message but were not edited by this session; left alone: ${listPaths(unknownLeft)}`,
         "warning",
       )
     }
@@ -358,7 +351,7 @@ async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
   let excluded: string[] = []
   let manualSkipped: string[] = []
   let filesToRestore: string[] = []
-  let unknownDeclined: string[] = []
+  let unknownLeft: string[] = []
   let otherSession: string[] = []
   let outcome: RestoreOutcome | null = null
   let didRestore = false
@@ -388,12 +381,15 @@ async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
         20,
         stats.binaryCount,
       )
-      let message = `${preview}\n\nRestore files to the state after this message?`
+      let message =
+        groups.editedFiles.length === 0
+          ? `This session did not edit any of the changed files with its file tools.\n\nRestore files to the state after this message?`
+          : `${preview}\n\nRestore files to the state after this message?`
       if (groups.unknownFiles.length > 0) {
-        message += `\n\nAlso changed during the message, not by this session's file tools:\n${formatList(groups.unknownFiles)}`
+        message += `\n\nChanged during the message by other sources, not restored:\n${formatList(groups.unknownFiles)}`
       }
       if (otherSession.length > 0) {
-        message += `\n\nEdited by other pi sessions, never restored:\n${formatList(otherSession)}`
+        message += `\n\nEdited by other pi sessions, not restored:\n${formatList(otherSession)}`
       }
       const ok = await ctx.ui.confirm("Redo message", message)
       if (!ok) {
@@ -401,26 +397,16 @@ async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
         return
       }
 
-      if (groups.unknownFiles.length > 0) {
-        const restoreUnknown = await ctx.ui.confirm(
-          "Unattributed changes",
-          `These changed during the message but this session's file tools did not edit them. Restore them too?\n\n${formatList(groups.unknownFiles)}`,
-        )
-        if (restoreUnknown) {
-          filesToRestore = [...groups.editedFiles, ...groups.unknownFiles]
-        } else {
-          filesToRestore = groups.editedFiles
-          unknownDeclined = groups.unknownFiles
-        }
-      } else {
-        filesToRestore = groups.editedFiles
-      }
+      // Files this session did not touch are never restored. The dialog
+      // above warns about them; they are left alone.
+      filesToRestore = groups.editedFiles
+      unknownLeft = groups.unknownFiles
 
-      // Files deliberately left alone (declined unknowns, other-session files)
+      // Files deliberately left alone (unattributed and other-session files)
       // still sit in the shadow index at their after state. Verification
       // compares the index to the target snapshot, so exclude them from the
       // check or a correct restore fails verification and rolls back.
-      const leftOut = [...unknownDeclined, ...groups.otherSessionFiles]
+      const leftOut = [...unknownLeft, ...groups.otherSessionFiles]
 
       if (filesToRestore.length > 0) {
         outcome = await restoreFiles(git, changes.after, filesToRestore, changes.before, {
@@ -497,9 +483,9 @@ async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
         "warning",
       )
     }
-    if (unknownDeclined.length > 0) {
+    if (unknownLeft.length > 0) {
       ctx.ui.notify(
-        `Note: ${unknownDeclined.length} file(s) changed during the message but were not edited by this session; left alone: ${listPaths(unknownDeclined)}`,
+        `Note: ${unknownLeft.length} file(s) changed during the message but were not edited by this session; left alone: ${listPaths(unknownLeft)}`,
         "warning",
       )
     }

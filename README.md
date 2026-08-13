@@ -38,12 +38,12 @@ restart.
   never snapshotted.
 - **Undo restores only what this session wrote.** Each message records which
   files its `write` and `edit` tools touched. Undo restores those files.
-  Files that changed during the message for another reason are listed
-  separately, and a dialog asks whether to restore them too. Files that
-  another pi session touched are never restored; a note names that session.
-  The records live in a small journal under the snapshot store, so they
-  survive restarts. Changes made by bash commands cannot be attributed and
-  are asked about.
+  Files that changed during the message for another reason are listed in
+  the dialog and never restored; a warning names them. Files that another
+  pi session touched get the session id in the warning. The records live
+  in a small journal under the snapshot store, so they survive restarts.
+  Changes made by bash commands cannot be attributed and are warned about
+  the same way.
 
 ## Configuration
 
