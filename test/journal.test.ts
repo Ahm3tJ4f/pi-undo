@@ -17,17 +17,20 @@ test("journal: sessionJournalFile sanitizes the session id", () => {
   );
 });
 
-test("journal: appendTouches writes one JSON line per path", async () => {
+test("journal: appendTouches writes one JSON line per entry", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "pi-undo-journal-"));
   try {
-    await appendTouches(dir, "sess1", ["a.txt", "sub/b.txt"], 123);
+    await appendTouches(dir, "sess1", [
+      { p: "a.txt", t: 100 },
+      { p: "sub/b.txt", t: 200 },
+    ]);
     const file = sessionJournalFile(dir, "sess1");
     const lines = (await readFile(file, "utf8")).trim().split("\n");
     assert.deepEqual(
       lines.map((line) => JSON.parse(line)),
       [
-        { p: "a.txt", t: 123 },
-        { p: "sub/b.txt", t: 123 },
+        { p: "a.txt", t: 100 },
+        { p: "sub/b.txt", t: 200 },
       ],
     );
   } finally {
@@ -35,17 +38,30 @@ test("journal: appendTouches writes one JSON line per path", async () => {
   }
 });
 
-test("journal: attributeTouches maps paths to other session ids and ignores the caller", async () => {
+test("journal: attributeTouches maps paths to other session ids inside the window only", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "pi-undo-journal-"));
   try {
-    await appendTouches(dir, "sess-a", ["a.txt", "shared.txt"]);
-    await appendTouches(dir, "sess-b", ["b.txt", "shared.txt"]);
-    await appendTouches(dir, "sess-c", ["c.txt"]);
+    await appendTouches(dir, "sess-a", [
+      { p: "a.txt", t: 100 },
+      { p: "stale.txt", t: 999 },
+    ]);
+    await appendTouches(dir, "sess-b", [
+      { p: "b.txt", t: 150 },
+      { p: "shared.txt", t: 50 },
+    ]);
+    // The caller's own touch must never attribute a path to itself.
+    await appendTouches(dir, "sess-c", [{ p: "a.txt", t: 100 }]);
 
-    const map = await attributeTouches(dir, "sess-a", ["a.txt", "b.txt", "shared.txt", "missing.txt"]);
-    assert.equal(map.get("a.txt"), undefined, "self-only path is excluded");
+    // Window [100, 200]: a.txt (100), b.txt (150) count. stale.txt (999) is
+    // outside. shared.txt (50) is outside too.
+    const map = await attributeTouches(dir, "sess-c", ["a.txt", "b.txt", "stale.txt", "shared.txt", "missing.txt"], {
+      from: 100,
+      to: 200,
+    });
+    assert.deepEqual(map.get("a.txt"), ["sess-a"], "self touch is excluded");
     assert.deepEqual(map.get("b.txt"), ["sess-b"]);
-    assert.deepEqual(map.get("shared.txt"), ["sess-b"]);
+    assert.equal(map.has("stale.txt"), false);
+    assert.equal(map.has("shared.txt"), false);
     assert.equal(map.has("missing.txt"), false);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -55,12 +71,12 @@ test("journal: attributeTouches maps paths to other session ids and ignores the 
 test("journal: attributeTouches ignores broken lines and missing files", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "pi-undo-journal-"));
   try {
-    await appendTouches(dir, "good", ["a.txt"]);
+    await appendTouches(dir, "good", [{ p: "a.txt", t: 10 }]);
     const file = sessionJournalFile(dir, "bad");
     await mkdir(path.dirname(file), { recursive: true });
-    await writeFile(file, '{"p": "a.txt", "t": 1}\nnot-json\n{"broken": true}\n');
+    await writeFile(file, '{"p": "a.txt", "t": 10}\nnot-json\n{"broken": true}\n');
 
-    const map = await attributeTouches(dir, "self", ["a.txt", "b.txt"]);
+    const map = await attributeTouches(dir, "self", ["a.txt", "b.txt"], { from: 0, to: 100 });
     assert.deepEqual((map.get("a.txt") ?? []).sort(), ["bad", "good"]);
     assert.equal(map.has("b.txt"), false);
   } finally {

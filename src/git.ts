@@ -168,7 +168,13 @@ export class ShadowGit implements SnapshotRepo {
       this.git(["diff", "--cached", "--name-only", "-z", snapshot, "--", ".", ...PI_EXCLUDE], {
         allowFailure: true,
       }),
-      this.git(["ls-files", "--full-name", "--others", "--exclude-standard", "-z", "--", ".", ...PI_EXCLUDE], {
+      // No --exclude-standard: a gitignored file deleted by the session
+      // leaves the index, and a hand recreated copy would be invisible if we
+      // filtered by the project's ignore rules here. Use pi-undo's own
+      // exclude file instead; checkIgnored below then classifies the still
+      // visible gitignored files into the `ignored` group, so manual
+      // recreations after a session deletion are protected.
+      this.git(["ls-files", "--full-name", "--others", "--exclude-from", this.excludeFile(), "-z", "--", ".", ...PI_EXCLUDE], {
         allowFailure: true,
       }),
     ])
@@ -177,7 +183,10 @@ export class ShadowGit implements SnapshotRepo {
       .filter((f): f is string => Boolean(f))
     // Untracked nested git repos are reported as dir/ entries. They are never
     // staged into snapshots, so they cannot be manual edits over a snapshot
-    // and must not block undo.
+    // and must not block undo. Untracked gitignored files stay visible (the
+    // listing uses pi-undo's exclude file, not --exclude-standard), so a
+    // gitignored file the session deleted and the user then recreated by hand
+    // is detected as a manual edit instead of being clobbered.
     const untrackedFiles = nulSplit(untracked.stdout)
       .map(normalizeGitPath)
       .filter((f): f is string => f !== undefined && !f.endsWith("/"))

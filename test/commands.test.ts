@@ -135,6 +135,7 @@ function makeCheckpoint(overrides: Partial<Checkpoint> = {}): Checkpoint {
     afterSnapshot: "after1",
     files: ["a.txt"],
     unattributed: [],
+    startedAt: 1,
     createdAt: 1,
     ...overrides,
   };
@@ -224,7 +225,7 @@ test("undo: dirty guard blocks when manual edits exist and user declines", async
   assert.match(ui.confirmCalls[0]!.message, /a\.txt/);
   assert.doesNotMatch(ui.confirmCalls[0]!.message, /b\.txt/);
   assert.deepEqual(navigations, []);
-  assert.deepEqual(repoState.state.calls, ["dirtySinceAll"]);
+  assert.deepEqual(repoState.state.calls, ["dirtySinceAll", "dirtySinceAll"]);
 });
 
 test("undo: dirty guard shows the preview and restores after force", async () => {
@@ -597,7 +598,7 @@ test("undo: declining the gitignored manual-edit dialog blocks undo", async () =
   await run("undo", ctx);
   assert.match(ui.notifications[0]!, /Undo blocked/);
   assert.deepEqual(navigations, []);
-  assert.deepEqual(repoState.state.calls, ["dirtySinceAll"]);
+  assert.deepEqual(repoState.state.calls, ["dirtySinceAll", "dirtySinceAll"]);
 });
 
 test("undo: unattributed files are skipped when the user declines", async () => {
@@ -633,9 +634,9 @@ test("undo: unattributed files are restored when the user confirms", async () =>
 test("undo: other-session files are never restored and the session is named", async () => {
   const storeDir = await mkdtemp(path.join(tmpdir(), "pi-undo-commands-"));
   try {
-    await appendTouches(storeDir, "other-session", ["b.txt"]);
+    await appendTouches(storeDir, "other-session", [{ p: "b.txt", t: 100 }]);
     const { store, repoState, run } = setup(makeRepo(storeDir));
-    store.add(makeCheckpoint({ files: ["a.txt", "b.txt"], unattributed: ["b.txt"] }));
+    store.add(makeCheckpoint({ files: ["a.txt", "b.txt"], unattributed: ["b.txt"], startedAt: 50, createdAt: 150 }));
     const { ctx, ui, navigations } = sessionCtx([makeEntry("u1", "user", "l0")]);
     await run("undo", ctx);
     assert.ok(repoState.state.calls.includes("restore:before1:a.txt"));
@@ -680,9 +681,9 @@ test("undo: restored count subtracts skipped and excluded files", async () => {
 test("diff: splits edited and unattributed files and marks other sessions", async () => {
   const storeDir = await mkdtemp(path.join(tmpdir(), "pi-undo-commands-"));
   try {
-    await appendTouches(storeDir, "other-session", ["b.txt"]);
+    await appendTouches(storeDir, "other-session", [{ p: "b.txt", t: 100 }]);
     const { store, repoState, run } = setup(makeRepo(storeDir));
-    store.add(makeCheckpoint({ files: ["a.txt", "b.txt", "c.txt"], unattributed: ["b.txt", "c.txt"] }));
+    store.add(makeCheckpoint({ files: ["a.txt", "b.txt", "c.txt"], unattributed: ["b.txt", "c.txt"], startedAt: 50, createdAt: 150 }));
     repoState.state.numstat = [
       { file: "a.txt", added: 1, removed: 0 },
       { file: "b.txt", added: 2, removed: 0 },
@@ -698,4 +699,53 @@ test("diff: splits edited and unattributed files and marks other sessions", asyn
   } finally {
     await rm(storeDir, { recursive: true, force: true });
   }
+});
+
+test("undo then redo does not show a spurious manual-edit prompt for a declined file", async () => {
+  const storeDir = path.join(tmpdir(), `pi-undo-redo-${process.pid}-${Math.random().toString(36).slice(2)}`);
+  const { store, repoState, run } = setup(makeRepo(storeDir));
+  // Snapshot-aware dirty state: b.txt differs from before1 (it sits at the
+  // after state because the undo declined it) but equals after1.
+  repoState.repo.dirtySinceAll = async (snapshot: string) =>
+    snapshot === "before1" ? { manual: ["b.txt"], ignored: [] } : { manual: [], ignored: [] };
+  store.add(makeCheckpoint({ files: ["a.txt", "b.txt"], unattributed: ["b.txt"] }));
+
+  // Undo: main dialog yes, unattributed dialog no, so b.txt stays at after1.
+  const undo = sessionCtx([makeEntry("u1", "user", "l0")]);
+  undo.ui.confirmQueue = [true, false];
+  await run("undo", undo.ctx);
+  assert.ok(repoState.state.calls.includes("restore:before1:a.txt"));
+  assert.ok(!repoState.state.calls.includes("restore:before1:a.txt,b.txt"));
+
+  // Redo must not ask about manual edits: b.txt already equals the target.
+  const redo = sessionCtx([makeEntry("u1", "user", "l0")]);
+  redo.ui.confirmQueue = [true, false];
+  await run("redo", redo.ctx);
+  assert.equal(
+    redo.ui.confirmCalls.some((c) => c.title === "Manual edits found"),
+    false,
+    "no spurious manual-edit prompt on redo",
+  );
+  assert.ok(repoState.state.calls.includes("restore:after1:a.txt"));
+  assert.ok(!repoState.state.calls.includes("restore:after1:a.txt,b.txt"));
+});
+
+test("undo: a file that equals the undo target is exempt from the manual-edit prompt", async () => {
+  const storeDir = path.join(tmpdir(), `pi-undo-sym-${process.pid}-${Math.random().toString(36).slice(2)}`);
+  const { store, repoState, run } = setup(makeRepo(storeDir));
+  // b.txt differs from after1 (it sits at the before state) but equals before1.
+  repoState.repo.dirtySinceAll = async (snapshot: string) =>
+    snapshot === "after1" ? { manual: ["b.txt"], ignored: [] } : { manual: [], ignored: [] };
+  store.add(makeCheckpoint({ files: ["a.txt", "b.txt"], unattributed: ["b.txt"] }));
+
+  const { ctx, ui } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  ui.confirmQueue = [true, false];
+  await run("undo", ctx);
+  assert.equal(
+    ui.confirmCalls.some((c) => c.title === "Manual edits found"),
+    false,
+    "a file already at the undo target is not a manual edit",
+  );
+  assert.ok(repoState.state.calls.includes("restore:before1:a.txt"));
+  assert.ok(!repoState.state.calls.includes("restore:before1:a.txt,b.txt"));
 });

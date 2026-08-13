@@ -227,3 +227,31 @@ test("capture: touched paths are journaled, normalized, and outside paths are sk
     await rm(storeDir, { recursive: true, force: true });
   }
 });
+
+test("capture: empty and dot paths are skipped, first touch wins, startedAt is set", async () => {
+  const storeDir = await mkdtemp(path.join(tmpdir(), "pi-undo-capture-"));
+  try {
+    const h = makeHarness({ changedFiles: ["a.txt"], storeDir });
+    await h.emit("before_agent_start", { prompt: "x", images: [] }, h.baseCtx);
+    await h.emit("message_start", { message: { role: "assistant" } }, h.baseCtx);
+    await h.emit("tool_call", { toolName: "write", input: { path: "" } }, h.baseCtx);
+    await h.emit("tool_call", { toolName: "write", input: { path: "." } }, h.baseCtx);
+    await h.emit("tool_call", { toolName: "write", input: { path: "a.txt" } }, h.baseCtx);
+    await h.emit("tool_call", { toolName: "write", input: { path: "/tmp/somewhere/a.txt" } }, h.baseCtx);
+    await h.emit("agent_settled", {}, h.baseCtx);
+
+    const checkpoint = h.store.get("u1");
+    assert.ok(checkpoint, "checkpoint exists");
+    assert.equal(typeof checkpoint.startedAt, "number");
+    assert.deepEqual(checkpoint.unattributed, []);
+
+    const file = sessionJournalFile(storeDir, "sess-1");
+    const lines = (await readFile(file, "utf8")).trim().split("\n");
+    const parsed = lines.map((line) => JSON.parse(line) as { p: string; t: number });
+    assert.equal(parsed.length, 1, "the duplicate touch of a.txt is deduped");
+    assert.equal(parsed[0]!.p, "a.txt");
+    assert.equal(typeof parsed[0]!.t, "number");
+  } finally {
+    await rm(storeDir, { recursive: true, force: true });
+  }
+});

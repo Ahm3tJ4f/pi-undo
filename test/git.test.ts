@@ -263,6 +263,41 @@ test("recomputing the skip list during rollback would skip the restored file", a
   }
 });
 
+test("a gitignored file recreated by hand after a session deletion is protected", async () => {
+  const dir = await newTempDir("pi-undo-recreate-ignored-");
+  try {
+    await writeFile(path.join(dir, ".gitignore"), "*.log\n");
+    await writeFile(path.join(dir, "x.log"), "one\n");
+
+    const git = await newShadow(dir);
+    const before = await tracked(git);
+
+    // The session deletes the gitignored file during the message.
+    await rm(path.join(dir, "x.log"));
+    const after = await tracked(git);
+    assert.deepEqual(await git.changedFiles(before, after), ["x.log"]);
+
+    // The user recreates it by hand with different content. It is untracked
+    // AND gitignored, so --exclude-standard would hide it from the guard.
+    // The listing uses pi-undo's own exclude file instead, so it is visible.
+    await writeFile(path.join(dir, "x.log"), "recreated\n");
+    assert.deepEqual((await git.dirtySinceAll(after)).ignored, ["x.log"]);
+
+    // Undo must skip it and keep the recreated content.
+    const outcome = await git.restoreSnapshot(before, ["x.log"], after);
+    assert.deepEqual(outcome.manualSkipped, ["x.log"]);
+    assert.equal(await readFile(path.join(dir, "x.log"), "utf8"), "recreated\n");
+
+    // The non-recreated flow still restores the pre-turn content normally.
+    await rm(path.join(dir, "x.log"));
+    const second = await git.restoreSnapshot(before, ["x.log"], after);
+    assert.deepEqual(second.manualSkipped, []);
+    assert.equal(await readFile(path.join(dir, "x.log"), "utf8"), "one\n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("untracked files over the size cap are excluded from snapshots", async () => {
   const dir = await newTempDir("pi-undo-large-");
   try {

@@ -122,6 +122,8 @@ function parseCheckpoint(
     typeof value.afterSnapshot === "string" ? value.afterSnapshot : null;
   if (value.files.length > 0 && (!beforeSnapshot || !afterSnapshot))
     return null;
+  const createdAt =
+    typeof value.createdAt === "number" ? value.createdAt : Date.now();
   return {
     userEntryId: value.userEntryId,
     beforeLeafId:
@@ -139,7 +141,8 @@ function parseCheckpoint(
           (file): file is string => typeof file === "string",
         )
       : [],
-    createdAt:
-      typeof value.createdAt === "number" ? value.createdAt : Date.now(),
+    startedAt:
+      typeof value.startedAt === "number" ? value.startedAt : createdAt,
+    createdAt,
   };
 }

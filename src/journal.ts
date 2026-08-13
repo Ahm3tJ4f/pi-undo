@@ -27,11 +27,10 @@ function journalDir(storeDir: string): string {
 export async function appendTouches(
   storeDir: string,
   sessionId: string,
-  paths: string[],
-  at = Date.now(),
+  entries: Array<{ p: string; t: number }>,
 ): Promise<void> {
-  if (paths.length === 0) return
-  const line = paths.map((p) => JSON.stringify({ p, t: at } satisfies JournalEntry)).join("\n") + "\n"
+  if (entries.length === 0) return
+  const line = entries.map((entry) => JSON.stringify(entry satisfies JournalEntry)).join("\n") + "\n"
   try {
     await mkdir(journalDir(storeDir), { recursive: true })
     await appendFile(sessionJournalFile(storeDir, sessionId), line)
@@ -55,6 +54,7 @@ export async function attributeTouches(
   storeDir: string,
   selfSessionId: string,
   paths: string[],
+  window: { from: number; to: number },
 ): Promise<Map<string, string[]>> {
   const wanted = new Set(paths)
   const result = new Map<string, string[]>()
@@ -85,6 +85,9 @@ export async function attributeTouches(
         continue
       }
       if (typeof entry.p !== "string" || !wanted.has(entry.p)) continue
+      // Only touches made inside the message window count. A stale touch
+      // from an old message must not attribute a path forever.
+      if (typeof entry.t !== "number" || entry.t < window.from || entry.t > window.to) continue
       const existing = result.get(entry.p)
       if (existing) existing.push(sessionId)
       else result.set(entry.p, [sessionId])

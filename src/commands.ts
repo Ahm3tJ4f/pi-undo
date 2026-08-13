@@ -19,6 +19,26 @@ interface AttributionGroups {
   otherSession: string[]
 }
 
+// Returns the message files that would be clobbered by a restore to `target`.
+// A file that currently equals the target snapshot cannot be clobbered by the
+// restore, so it is never a manual edit for this operation. This keeps a
+// declined file (left at the after state by an undo, or at the before state by
+// a redo) from triggering a spurious manual-edits prompt on the opposite
+// operation.
+async function manualEdits(
+  git: SnapshotRepo,
+  since: string,
+  target: string,
+  messageFiles: ReadonlySet<string>,
+): Promise<string[]> {
+  const dirty = await git.dirtySinceAll(since)
+  const candidates = [...dirty.manual, ...dirty.ignored].filter((file) => messageFiles.has(file))
+  if (candidates.length === 0) return []
+  const targetDirty = await git.dirtySinceAll(target)
+  const targetSet = new Set([...targetDirty.manual, ...targetDirty.ignored])
+  return candidates.filter((file) => targetSet.has(file))
+}
+
 async function restoreFiles(
   git: SnapshotRepo,
   target: string,
@@ -66,10 +86,18 @@ async function splitFiles(
   const unattributed = checkpoint.unattributed ?? []
   const unattributedSet = new Set(unattributed)
   const editedFiles = checkpoint.files.filter((file) => !unattributedSet.has(file))
+  // Only touches made during this message count. A stale touch from an old
+  // message must not permanently attribute a path to another session. Old
+  // checkpoints without startedAt fall back to a zero-width window around
+  // createdAt, so every unattributed file degrades safely to "unknown".
+  const window = {
+    from: checkpoint.startedAt ?? checkpoint.createdAt,
+    to: checkpoint.createdAt,
+  }
   let attributed = new Map<string, string[]>()
   if (unattributed.length > 0) {
     try {
-      attributed = await attributeTouches(git.storeDir, selfSessionId, unattributed)
+      attributed = await attributeTouches(git.storeDir, selfSessionId, unattributed, window)
     } catch {
       attributed = new Map()
     }
@@ -153,13 +181,11 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
   try {
     if (changes) {
       const git = deps.getGit(ctx)
-      const dirty = await git.dirtySinceAll(changes.after)
       // Only files the message changed can be clobbered by the restore.
       // Manual edits in other files survive the undo, so they must not
       // block it or trigger the dialog. Gitignored files are included too:
       // the dialog now covers them instead of skipping them silently.
-      const messageFiles = new Set(checkpoint.files)
-      const manualInMessage = [...dirty.manual, ...dirty.ignored].filter((file) => messageFiles.has(file))
+      const manualInMessage = await manualEdits(git, changes.after, changes.before, new Set(checkpoint.files))
       if (manualInMessage.length > 0) {
         const list = formatList(manualInMessage)
         const force = await ctx.ui.confirm(
@@ -327,9 +353,7 @@ async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
   try {
     if (changes) {
       const git = deps.getGit(ctx)
-      const dirty = await git.dirtySinceAll(changes.before)
-      const messageFiles = new Set(checkpoint.files)
-      const manualInMessage = [...dirty.manual, ...dirty.ignored].filter((file) => messageFiles.has(file))
+      const manualInMessage = await manualEdits(git, changes.before, changes.after, new Set(checkpoint.files))
       if (manualInMessage.length > 0) {
         const list = formatList(manualInMessage)
         const force = await ctx.ui.confirm(
@@ -497,7 +521,11 @@ async function diff(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
     if (unattributed.length > 0) {
       let attributed = new Map<string, string[]>()
       try {
-        attributed = await attributeTouches(git.storeDir, ctx.sessionManager.getSessionId(), unattributed)
+        const window = {
+          from: checkpoint.startedAt ?? checkpoint.createdAt,
+          to: checkpoint.createdAt,
+        }
+        attributed = await attributeTouches(git.storeDir, ctx.sessionManager.getSessionId(), unattributed, window)
       } catch {
         attributed = new Map()
       }

@@ -33,7 +33,8 @@ export function setupCapture(pi: Pick<ExtensionAPI, "on">, store: CheckpointStor
         userEntryId: null,
         beforeLeafId: null,
         beforeSnapshot: beforeSnapshot ?? null,
-        touched: new Set(),
+        touched: new Map(),
+        startAt: Date.now(),
       }
     } catch (error) {
       active = null
@@ -56,10 +57,10 @@ export function setupCapture(pi: Pick<ExtensionAPI, "on">, store: CheckpointStor
     await finalize(ctx)
   })
 
-  // Record the paths this session's write/edit tools touch. The built-in
-  // `write` and `edit` tools take a `path` field. Bash can change files too,
-  // but we cannot see which files it writes, so those changes stay
-  // unattributed.
+  // Record the paths this session's write/edit tools touch, with the time of
+  // the first touch. The built-in `write` and `edit` tools take a `path`
+  // field. Bash can change files too, but we cannot see which files it
+  // writes, so those changes stay unattributed.
   pi.on("tool_call", (event, ctx) => {
     if (!active) return
     if (event.toolName !== "write" && event.toolName !== "edit") return
@@ -69,7 +70,9 @@ export function setupCapture(pi: Pick<ExtensionAPI, "on">, store: CheckpointStor
     const abs = path.isAbsolute(p) ? p : path.resolve(ctx.cwd, p)
     const rel = path.relative(ctx.cwd, abs)
     if (rel.startsWith("..") || path.isAbsolute(rel)) return
-    active.touched.add(rel.replaceAll("\\", "/"))
+    const normalized = rel.replaceAll("\\", "/")
+    if (normalized === "" || normalized === ".") return
+    if (!active.touched.has(normalized)) active.touched.set(normalized, Date.now())
   })
 
   async function finalize(ctx: ExtensionContext): Promise<void> {
@@ -83,7 +86,8 @@ export function setupCapture(pi: Pick<ExtensionAPI, "on">, store: CheckpointStor
       const files = await git.changedFiles(turn.beforeSnapshot, afterSnapshot)
       const unattributed = files.filter((file) => !turn.touched.has(file))
       try {
-        await journal.appendTouches(git.storeDir, ctx.sessionManager.getSessionId(), [...turn.touched])
+        const entries = [...turn.touched.entries()].map(([p, t]) => ({ p, t }))
+        await journal.appendTouches(git.storeDir, ctx.sessionManager.getSessionId(), entries)
       } catch {
         // Journal is best effort.
       }
@@ -99,6 +103,7 @@ export function setupCapture(pi: Pick<ExtensionAPI, "on">, store: CheckpointStor
         afterSnapshot: files.length > 0 ? afterSnapshot : null,
         files,
         unattributed,
+        startedAt: turn.startAt,
         createdAt: Date.now(),
       })
     } catch (error) {
