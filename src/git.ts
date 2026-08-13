@@ -158,7 +158,8 @@ export class ShadowGit implements SnapshotRepo {
   // files undo may clobber (they trigger the manual-edit dialog), `ignored`
   // are files matched by an exclude rule (our patterns, the project's own
   // .gitignore, or the source repo's info/exclude). Manual edits to ignored
-  // files are never reverted, so they must never block undo.
+  // files trigger the same prompt as manual edits to tracked files; they are
+  // never reverted without a confirmation.
   private async dirtyLists(snapshot: string): Promise<{ manual: string[]; ignored: string[] }> {
     await this.ensure()
     const meta = await this.readMeta()

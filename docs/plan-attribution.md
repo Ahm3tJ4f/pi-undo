@@ -62,8 +62,11 @@ under the shadow store directory:
 `<store>/journal/<sessionId>.jsonl`. The store directory is keyed by the
 project path. Two pi sessions in the same project share it.
 
-At undo time, the commands read the journal files of OTHER sessions.
-They map each unattributed file to the sessions that touched it.
+Each journal line stores the path and the first touch time. The touch
+happens at `tool_call` time, not at finalize time. At undo time, the
+commands read the journal files of OTHER sessions. They count only
+entries inside the message window: from the checkpoint start time to the
+checkpoint end time. Stale touches do not count.
 
 The journal is best effort. A missing or broken file is ignored.
 
