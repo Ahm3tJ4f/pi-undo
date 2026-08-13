@@ -81,19 +81,34 @@ Severity: **core** = must always work, **edge** = rare but should not break badl
   excludes, global gitignore): the file is snapshotted like a normal file,
   `/undo` and `/redo` restore it, and the diff preview shows it.
 - US-58 (core) A gitignored file has manual edits since the message: undo and
-  redo leave the file alone and never block on it. Manual edits are never
-  reverted, even in a file the session edited during the message.
+  redo show the manual-edits prompt. Confirming restores the file and loses
+  the manual edits. Declining blocks the operation.
 - US-59 (core) The session edits a gitignored file that had manual edits
   before the turn: `/undo` restores the pre-turn state, manual edits included.
 - US-60 (edge) A gitignored file the session edited gets manual edits after
-  the turn: `/undo` and `/redo` skip the file and keep the manual edits, with
-  a note. The session's edit to that file is then not undone either.
+  the turn: `/undo` and `/redo` show the manual-edits prompt and list the
+  file. Confirming restores the pre-turn state, so the manual edits are lost.
+  Declining blocks the operation and keeps the file and its manual edits.
 - US-61 (edge) A file becomes gitignored after it was snapshotted: it stays
   snapshotted; the session's edits to it remain undoable. Only pi-undo's own
   `excludeDirectories` stop new snapshots of a file.
 - US-62 (edge) A file becomes excluded by `excludeDirectories` after it was
   snapshotted: restore skips it, keeps manual edits, and drops it from the
   index (transition window).
+
+## 3c. Attribution of file changes
+
+- US-63 (core) The session writes a file with the `write` or `edit` tool: the
+  checkpoint marks the file as edited by this session. `/undo` and `/redo`
+  restore it.
+- US-64 (core) A file changes during the message, but no `write` or `edit`
+  tool touched it: the preview lists it as unattributed. The undo dialog asks
+  whether to restore it. The default is no.
+- US-65 (edge) Another pi session touched the file during the message: the
+  journal names that session. `/undo` never restores the file and shows a
+  note with the session id.
+- US-66 (edge) A bash command changes a file: the file is unattributed, so
+  the dialog asks about it.
 
 ## 4. Failures and verification
 
@@ -137,9 +152,10 @@ Severity: **core** = must always work, **edge** = rare but should not break badl
 
 - US-45 (core) Undo in `~/`: no false manual-edits dialog, restore only
   touches the message's files.
-- US-46 (core) Files under blacklisted dirs (node_modules, dist, tool caches)
-  are not snapshotted and not undoable. This is pi-undo's own exclusion list;
-  the project's `.gitignore` does NOT exclude files from snapshots.
+- US-46 (core) Files under blacklisted dirs (node_modules, dist, __pycache__,
+  tool caches) are not snapshotted and not undoable. This is pi-undo's own
+  exclusion list; the project's `.gitignore` does NOT exclude files from
+  snapshots.
 - US-47 (edge) Edits inside nested git repos are not undoable (the repo has
   its own git undo).
 - US-48 (edge) A file that was snapshotted earlier and later becomes

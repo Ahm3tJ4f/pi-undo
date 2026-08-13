@@ -31,10 +31,19 @@ restart.
   after tree hash. Undo restores only the files that message changed.
 - **Gitignored files are undoable when the session edits them.** The shadow
   repo snapshots gitignored files too, so a file the current pi session
-  touched can always be undone, even if it is in `.gitignore`. Manual edits
-  are never reverted: a gitignored file with manual edits since the message
-  is left alone by undo and redo, with a note. Only pi-undo's own
-  `excludeDirectories` are never snapshotted.
+  touched can always be undone, even if it is in `.gitignore`. A gitignored
+  file with manual edits since the message triggers the manual-edits
+  question. Confirming restores the file and loses the manual edits.
+  Declining blocks the undo. Only pi-undo's own `excludeDirectories` are
+  never snapshotted.
+- **Undo restores only what this session wrote.** Each message records which
+  files its `write` and `edit` tools touched. Undo restores those files.
+  Files that changed during the message for another reason are listed
+  separately, and a dialog asks whether to restore them too. Files that
+  another pi session touched are never restored; a note names that session.
+  The records live in a small journal under the snapshot store, so they
+  survive restarts. Changes made by bash commands cannot be attributed and
+  are asked about.
 
 ## Configuration
 
