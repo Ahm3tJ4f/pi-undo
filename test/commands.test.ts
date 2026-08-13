@@ -64,6 +64,8 @@ function makeRepo(): {
     dirty: string[];
     verify: (snapshot: string) => boolean;
     numstat: NumstatRow[];
+    manualSkipped: string[];
+    restoreOpts: ({ manualSet?: ReadonlySet<string>; force?: boolean } | undefined)[];
   };
 } {
   const state = {
@@ -71,6 +73,8 @@ function makeRepo(): {
     dirty: [] as string[],
     verify: (_snapshot: string) => true,
     numstat: [] as NumstatRow[],
+    manualSkipped: [] as string[],
+    restoreOpts: [] as ({ manualSet?: ReadonlySet<string>; force?: boolean } | undefined)[],
   };
   const repo: SnapshotRepo = {
     async ensure() {},
@@ -86,9 +90,10 @@ function makeRepo(): {
       state.calls.push("dirtySince");
       return state.dirty;
     },
-    async restoreSnapshot(_snapshot, files) {
+    async restoreSnapshot(_snapshot, files, _since, opts) {
       state.calls.push(`restore:${_snapshot}:${files.join(",")}`);
-      return { skipped: [], excluded: [], manualSkipped: [] };
+      state.restoreOpts.push(opts);
+      return { skipped: [], excluded: [], manualSkipped: state.manualSkipped };
     },
     async verifySnapshot(snapshot) {
       state.calls.push(`verify:${snapshot}`);
@@ -282,6 +287,20 @@ test("undo: verify failure rolls the files back and does not navigate", async ()
     "rollback is verified",
   );
   assert.match(ui.notifications[0]!, /roll/);
+});
+
+test("undo: rollback passes the original manualSkipped list to the restore", async () => {
+  const { store, repoState, run } = setup();
+  store.add(makeCheckpoint({ files: ["a.txt", "x.log"] }));
+  repoState.state.verify = (snapshot) => snapshot !== "before1";
+  repoState.state.manualSkipped = ["x.log"];
+  const { ctx } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  await run("undo", ctx);
+  // The first restore targets before1 and returns manualSkipped ["x.log"].
+  // The rollback restore targets after1 and must reuse that same list.
+  const rollbackOpts = repoState.state.restoreOpts[1];
+  assert.ok(rollbackOpts?.manualSet?.has("x.log"));
+  assert.equal(rollbackOpts?.manualSet?.size, 1);
 });
 
 test("undo: failed rollback after a bad restore warns about inconsistency", async () => {

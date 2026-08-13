@@ -61,7 +61,12 @@ export interface SnapshotRepo {
   track(): Promise<string | undefined>
   changedFiles(from: string, to: string): Promise<string[]>
   dirtySince(snapshot: string): Promise<string[]>
-  restoreSnapshot(snapshot: string, files: string[], since?: string): Promise<RestoreResult>
+  restoreSnapshot(
+    snapshot: string,
+    files: string[],
+    since?: string,
+    opts?: { manualSet?: ReadonlySet<string>; force?: boolean },
+  ): Promise<RestoreResult>
   verifySnapshot(snapshot: string, exclude?: string[]): Promise<boolean>
   diffNumstat(from: string, to: string): Promise<DiffStatResult>
   gcIfDue(): Promise<void>
@@ -181,7 +186,12 @@ export class ShadowGit implements SnapshotRepo {
     }
   }
 
-  async restoreSnapshot(snapshot: string, files: string[], since?: string): Promise<RestoreResult> {
+  async restoreSnapshot(
+    snapshot: string,
+    files: string[],
+    since?: string,
+    opts: { manualSet?: ReadonlySet<string>; force?: boolean } = {},
+  ): Promise<RestoreResult> {
     await this.ensure()
     // Make sure info/exclude reflects the current config and large-file
     // excludes before the ignore checks below: callers do not always go
@@ -208,7 +218,13 @@ export class ShadowGit implements SnapshotRepo {
     // given (the other snapshot of the message), files that are ignored AND
     // changed since that snapshot are left alone, even if the session edited
     // them in the message being undone.
-    const manualSet = since ? new Set((await this.dirtyLists(since)).ignored) : new Set<string>()
+    const manualSet = opts.force
+      ? new Set<string>()
+      : opts.manualSet
+        ? new Set(opts.manualSet)
+        : since
+          ? new Set((await this.dirtyLists(since)).ignored)
+          : new Set<string>()
     for (const rel of rels) {
       if (await this.hasSymlinkParent(rel)) blocked.push(rel)
       else if (matcher.ignores(rel)) excluded.push(rel)

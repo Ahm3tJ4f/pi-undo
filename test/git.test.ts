@@ -208,6 +208,61 @@ test("undo of a gitignored file restores its pre-turn state", async () => {
   }
 });
 
+test("rollback of a gitignored file restores it using the original skip list", async () => {
+  const dir = await newTempDir("pi-undo-rollback-ignored-");
+  try {
+    await writeFile(path.join(dir, ".gitignore"), "*.log\n");
+    await writeFile(path.join(dir, "x.log"), "one\n");
+
+    const git = await newShadow(dir);
+    const before = await tracked(git);
+
+    // The session edits the gitignored file.
+    await writeFile(path.join(dir, "x.log"), "two\n");
+    const after = await tracked(git);
+    assert.deepEqual(await git.changedFiles(before, after), ["x.log"]);
+
+    // A failed undo restores x.log to the before state. No manual edits
+    // existed, so nothing is skipped.
+    const first = await git.restoreSnapshot(before, ["x.log"], after);
+    assert.deepEqual(first.manualSkipped, []);
+    assert.equal(await readFile(path.join(dir, "x.log"), "utf8"), "one\n");
+
+    // Rollback must reuse the original skip list. An empty list restores
+    // x.log back to the after state instead of leaving it at "one".
+    await git.restoreSnapshot(after, ["x.log"], undefined, { manualSet: new Set(first.manualSkipped) });
+    assert.equal(await readFile(path.join(dir, "x.log"), "utf8"), "two\n");
+    assert.equal(await git.verifySnapshot(after), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("recomputing the skip list during rollback would skip the restored file", async () => {
+  const dir = await newTempDir("pi-undo-rollback-oldbug-");
+  try {
+    await writeFile(path.join(dir, ".gitignore"), "*.log\n");
+    await writeFile(path.join(dir, "x.log"), "one\n");
+
+    const git = await newShadow(dir);
+    const before = await tracked(git);
+    await writeFile(path.join(dir, "x.log"), "two\n");
+    const after = await tracked(git);
+
+    await git.restoreSnapshot(before, ["x.log"], after);
+    assert.equal(await readFile(path.join(dir, "x.log"), "utf8"), "one\n");
+
+    // The old behavior recomputed the skip list from the mutated tree. Since
+    // x.log now differs from the after snapshot and is gitignored, it is
+    // classified as a manual edit and skipped.
+    const outcome = await git.restoreSnapshot(after, ["x.log"], after);
+    assert.deepEqual(outcome.manualSkipped, ["x.log"]);
+    assert.equal(await readFile(path.join(dir, "x.log"), "utf8"), "one\n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("untracked files over the size cap are excluded from snapshots", async () => {
   const dir = await newTempDir("pi-undo-large-");
   try {

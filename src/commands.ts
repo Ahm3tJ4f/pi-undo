@@ -10,17 +10,25 @@ async function restoreFiles(
   target: string,
   files: string[],
   since?: string,
+  opts?: { manualSet?: ReadonlySet<string>; force?: boolean },
 ): Promise<{ ok: boolean; skipped: string[]; excluded: string[]; manualSkipped: string[] }> {
-  const { skipped, excluded, manualSkipped } = await git.restoreSnapshot(target, files, since)
+  const { skipped, excluded, manualSkipped } = await git.restoreSnapshot(target, files, since, opts)
   const ok = await git.verifySnapshot(target, [...skipped, ...excluded, ...manualSkipped])
   return { ok, skipped, excluded, manualSkipped }
 }
 
-async function rollbackFiles(git: SnapshotRepo, snapshot: string, files: string[]): Promise<boolean> {
+async function rollbackFiles(
+  git: SnapshotRepo,
+  snapshot: string,
+  files: string[],
+  outcome: { skipped: string[]; excluded: string[]; manualSkipped: string[] },
+): Promise<boolean> {
   try {
-    // Rollback must not clobber manual edits in gitignored files either, so
-    // it skips files with manual edits relative to the rollback target.
-    return (await restoreFiles(git, snapshot, files, snapshot)).ok
+    // Rollback must skip exactly the files the failed restore skipped: those
+    // files were never changed by it. Recomputing the manual-edit list now
+    // would see the failed restore's own changes and skip files it just
+    // restored. Pass the original manualSkipped list through as manualSet.
+    return (await restoreFiles(git, snapshot, files, undefined, { manualSet: new Set(outcome.manualSkipped) })).ok
   } catch {
     return false
   }
@@ -123,7 +131,7 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
 
       const outcome = await restoreFiles(git, changes.before, checkpoint.files, changes.after)
       if (!outcome.ok) {
-        const rolledBack = await rollbackFiles(git, changes.after, checkpoint.files)
+        const rolledBack = await rollbackFiles(git, changes.after, checkpoint.files, outcome)
         ctx.ui.notify(
           rolledBack
             ? "Undo failed: restored files do not match the snapshot; state rolled back"
@@ -143,7 +151,11 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
       result = await ctx.navigateTree(checkpoint.beforeLeafId, { summarize: false })
     } catch (error) {
       if (changes) {
-        const rolledBack = await rollbackFiles(deps.getGit(ctx), changes.after, checkpoint.files)
+        const rolledBack = await rollbackFiles(deps.getGit(ctx), changes.after, checkpoint.files, {
+          skipped,
+          excluded,
+          manualSkipped,
+        })
         if (!rolledBack) {
           ctx.ui.notify(
             `Undo failed: ${errorMessage(error)}; the file rollback also failed, the working tree can be inconsistent`,
@@ -158,7 +170,11 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
     if (result.cancelled) {
       
       if (changes) {
-        const rolledBack = await rollbackFiles(deps.getGit(ctx), changes.after, checkpoint.files)
+        const rolledBack = await rollbackFiles(deps.getGit(ctx), changes.after, checkpoint.files, {
+          skipped,
+          excluded,
+          manualSkipped,
+        })
         if (!rolledBack) {
           ctx.ui.notify("Undo cancelled; the file rollback also failed, the working tree can be inconsistent", "warning")
           return
@@ -232,7 +248,7 @@ async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
       }
       const outcome = await restoreFiles(git, changes.after, checkpoint.files, changes.before)
       if (!outcome.ok) {
-        const rolledBack = await rollbackFiles(git, changes.before, checkpoint.files)
+        const rolledBack = await rollbackFiles(git, changes.before, checkpoint.files, outcome)
         ctx.ui.notify(
           rolledBack
             ? "Redo failed: restored files do not match the snapshot; state rolled back"
@@ -252,7 +268,11 @@ async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
       result = await ctx.navigateTree(checkpoint.finalLeafId, { summarize: false })
     } catch (error) {
       if (changes) {
-        const rolledBack = await rollbackFiles(deps.getGit(ctx), changes.before, checkpoint.files)
+        const rolledBack = await rollbackFiles(deps.getGit(ctx), changes.before, checkpoint.files, {
+          skipped,
+          excluded,
+          manualSkipped,
+        })
         if (!rolledBack) {
           ctx.ui.notify(
             `Redo failed: ${errorMessage(error)}; the file rollback also failed, the working tree can be inconsistent`,
@@ -266,7 +286,11 @@ async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
     }
     if (result.cancelled) {
       if (changes) {
-        const rolledBack = await rollbackFiles(deps.getGit(ctx), changes.before, checkpoint.files)
+        const rolledBack = await rollbackFiles(deps.getGit(ctx), changes.before, checkpoint.files, {
+          skipped,
+          excluded,
+          manualSkipped,
+        })
         if (!rolledBack) {
           ctx.ui.notify("Redo cancelled; the file rollback also failed, the working tree can be inconsistent", "warning")
           return
