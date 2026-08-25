@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext, SessionEntry } from "@earendil-works/pi-coding-agent"
 import path from "node:path"
-import type { SnapshotRepo } from "./git.ts"
+import { canonicalizePath, type SnapshotRepo } from "./git.ts"
 import * as journal from "./journal.ts"
 import type { CheckpointStore } from "./store.ts"
 import type { UserMessageEntry } from "./types.ts"
@@ -133,14 +133,17 @@ export function setupCapture(
     // The capture begins without awaiting it: the handler returns within
     // its budget even when the pre-turn snapshot needs minutes (huge
     // first-ever capture over a big workspace).
-    const existing = pendingByCwd.get(ctx.cwd)
+    // Key by the canonical spelling so a client-supplied non-canonical cwd
+    // (RPC mode) cannot fork the churn map or miss a pending capture.
+    const cwdKey = canonicalizePath(ctx.cwd)
+    const existing = pendingByCwd.get(cwdKey)
     if (existing) {
       active = freshTurn(event.prompt, event.images?.length ?? 0, null)
       return
     }
     try {
       const git = deps.getGit(ctx)
-      active = freshTurn(event.prompt, event.images?.length ?? 0, beginCapture(() => git.track(), ctx.cwd, pendingByCwd))
+      active = freshTurn(event.prompt, event.images?.length ?? 0, beginCapture(() => git.track(), cwdKey, pendingByCwd))
     } catch (error) {
       active = null
       ctx.ui.notify(`pi-undo: pre-turn snapshot failed, undo disabled for this message: ${errorMessage(error)}`, "warning")
@@ -224,6 +227,9 @@ export function setupCapture(
     }
     if (!turn || !turn.userEntryId || !beforeSnapshot) return
 
+      // This AFTER track can serialize against a next turn's BEFORE track
+      // via the shadow index.lock when a deferred finalize lands late. Git
+      // handles that safely; only latency is shared.
     try {
       const git = deps.getGit(ctx)
       const afterSnapshot = await git.track()
@@ -257,7 +263,7 @@ export function setupCapture(
 
   const controller: CaptureController = {
     waitForPending: async (cwd) => {
-      const pending = pendingByCwd.get(cwd)
+      const pending = pendingByCwd.get(canonicalizePath(cwd))
       if (!pending) return { settled: true }
       const outcome = await withDeadline(pending.complete, deadlineMs())
       return { settled: outcome !== "timed-out" }

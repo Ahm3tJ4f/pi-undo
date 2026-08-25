@@ -7,6 +7,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import {
+  ADD_TIMEOUT,
   canonicalizePath,
   evictStaleStores,
   GC_AFTER_CAPTURES,
@@ -17,6 +18,7 @@ process.env.PI_UNDO_STORE_ROOT = path.join(tmpdir(), `pi-undo-port-store-${proce
 
 interface RecordedCall {
   args: string[];
+  options?: { cwd?: string; timeout?: number } | undefined;
 }
 
 function recordingPi(): {
@@ -32,7 +34,7 @@ function recordingPi(): {
     calls,
     exec: (command, args, options) =>
       new Promise((resolve) => {
-        if (command === "git") calls.push({ args: [...args] });
+        if (command === "git") calls.push({ args: [...args], options });
         execFile(
           command,
           args,
@@ -78,13 +80,13 @@ test("the shadow store root inside the worktree is seeded into both exclude file
     const stagingExclude = await readFile(path.join(git.storeDir, "info", "pi-undo-exclude"), "utf8");
     assert.match(
       stagingExclude,
-      /^\.pi-store\/[0-9a-f]+\/$/m,
+      /^\/\.pi-store\/[0-9a-f]+\/$/m,
       "staging filter must carry the relative store-root entry",
     );
     const infoExclude = await readFile(path.join(git.storeDir, "info", "exclude"), "utf8");
     assert.match(
       infoExclude,
-      /^\.pi-store\/[0-9a-f]+\/$/m,
+      /^\/\.pi-store\/[0-9a-f]+\/$/m,
       "manual-edit guard must also ignore the store root",
     );
 
@@ -136,9 +138,16 @@ test(`a background gc fires within ${GC_AFTER_CAPTURES} captures`, async () => {
     await git.ensure();
     pi.calls.length = 0;
 
-    for (let i = 0; i < GC_AFTER_CAPTURES; i++) {
+    for (let i = 0; i < GC_AFTER_CAPTURES - 1; i++) {
       await git.track();
     }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.ok(
+      !pi.calls.some((call) => call.args.includes("gc")),
+      "no gc before the threshold",
+    );
+
+    await git.track();
 
     // The gc is fired without blocking track(); give it a moment to land.
     let sawGc = false;
@@ -159,5 +168,24 @@ test(`a background gc fires within ${GC_AFTER_CAPTURES} captures`, async () => {
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
     }
+  }
+});
+
+test("staging git calls carry the long ADD_TIMEOUT", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "pi-undo-addtimeout-"));
+  try {
+    await writeFile(path.join(dir, "a.txt"), "one\n");
+    const pi = recordingPi();
+    const git = new ShadowGit(pi as never, dir);
+    await git.track();
+    assert.ok(
+      pi.calls.some(
+        (call) =>
+          call.args.includes("add") && call.options?.timeout === ADD_TIMEOUT,
+      ),
+      `the bulk add must run with the generous ${ADD_TIMEOUT}ms ceiling`,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });

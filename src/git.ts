@@ -21,7 +21,7 @@ const GIT_TIMEOUT = 120_000
 // for minutes. Those calls happen outside any turn handler (bounded
 // capture), so give them a generous ceiling instead of killing git
 // mid-write, which would strand an index.lock behind.
-const ADD_TIMEOUT = 600_000
+export const ADD_TIMEOUT = 600_000
 
 // Remove a shadow index.lock left behind by a git process that was killed
 // mid-run (machine sleep, forced exit). Locks younger than this are left
@@ -700,7 +700,7 @@ export class ShadowGit implements SnapshotRepo {
     const relStore = path.relative(this.cwd, this.gitdir)
     const storeLines =
       relStore && relStore !== "." && !relStore.startsWith("..") && !path.isAbsolute(relStore)
-        ? [`${relStore.replaceAll("\\", "/")}/`]
+        ? [`/${relStore.replaceAll("\\", "/")}/`]
         : []
     // Keep only the large-file excludes that no config pattern covers.
     // Entries covered by a config pattern are redundant; entries covered only
@@ -820,8 +820,12 @@ export async function evictStaleStores(root: string = snapshotStoreRoot()): Prom
     try {
       statSync(cwd)
       continue
-    } catch {
-      // Workspace gone: safe to drop the store.
+    } catch (error) {
+      // Only a proven-missing workspace makes the store droppable. EIO,
+      // EACCES or ENODEV mean the volume is merely unreachable right now
+      // (VPN down, sleeping disk) — evicting then would destroy undo
+      // history for a workspace that still exists.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue
     }
     for (let attempt = 0; attempt < 4; attempt++) {
       try {
