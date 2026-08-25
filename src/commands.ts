@@ -3,7 +3,8 @@ import type { CaptureDeps } from "./capture.ts"
 import type { SnapshotRepo } from "./git.ts"
 import { attributeTouches } from "./journal.ts"
 import type { CheckpointStore } from "./store.ts"
-import type { Checkpoint } from "./types.ts"
+import type { Checkpoint, UserMessageEntry } from "./types.ts"
+import { isUserMessageEntry } from "./types.ts"
 import { errorMessage, formatNumstat, listPaths } from "./util.ts"
 
 interface RestoreOutcome {
@@ -177,7 +178,35 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
   await ensureIdle(ctx)
   const checkpoint = store.latestOnBranch(ctx.sessionManager.getBranch())
   if (!checkpoint) {
-    ctx.ui.notify("Nothing to undo", "info")
+    // No checkpoint anywhere on the branch: every message predates
+    // pi-undo arming in this workspace (or its snapshot was skipped).
+    // File states were never captured, so they cannot be reverted — but
+    // removing the message itself is still what undo is for. Offer a
+    // transcript-only rewind instead of a bare refusal.
+    const branch = ctx.sessionManager.getBranch()
+    let target: UserMessageEntry | undefined
+    for (let i = branch.length - 1; i >= 0; i--) {
+      const entry = branch[i]
+      if (entry && isUserMessageEntry(entry)) {
+        target = entry
+        break
+      }
+    }
+    if (!target || !target.parentId) {
+      ctx.ui.notify("Nothing to undo", "info")
+      return
+    }
+    const ok = await ctx.ui.confirm(
+      "No snapshot exists",
+      "This message predates pi-undo arming in this workspace, so its file changes were never captured and cannot be reverted.\n\nRemove the message without reverting files?",
+    )
+    if (!ok) return
+    const fallback = await ctx.navigateTree(target.parentId, { summarize: false })
+    if (fallback.cancelled) {
+      ctx.ui.notify("Undo cancelled", "info")
+      return
+    }
+    ctx.ui.notify("Removed message; files left untouched", "info")
     return
   }
   if (!checkpoint.beforeLeafId) {

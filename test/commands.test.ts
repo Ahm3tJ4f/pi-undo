@@ -200,6 +200,32 @@ test("undo: nothing to undo when no checkpoint is on the branch", async () => {
   assert.equal(navigations.length, 0);
 });
 
+test("undo: offers transcript-only removal when no checkpoint exists", async () => {
+  const { run, repoState } = setup();
+  const { ctx, ui, navigations } = sessionCtx([
+    makeEntry("u1", "user", "p0"),
+    makeEntry("a1", "assistant", "u1"),
+  ]);
+  await run("undo", ctx);
+  assert.match(ui.confirmCalls[0]!.title, /No snapshot/);
+  assert.match(ui.confirmCalls[0]!.message, /without reverting files/);
+  assert.deepEqual(navigations, [{ target: "p0" }]);
+  assert.equal(ui.notifications[0], "Removed message; files left untouched");
+  assert.deepEqual(repoState.state.calls, [], "no file operations at all");
+});
+
+test("undo: declining the transcript-only fallback does nothing", async () => {
+  const { run, repoState } = setup();
+  const { ctx, ui, navigations } = sessionCtx([
+    makeEntry("u1", "user", "p0"),
+    makeEntry("a1", "assistant", "u1"),
+  ]);
+  ui.confirmResult = false;
+  await run("undo", ctx);
+  assert.equal(navigations.length, 0);
+  assert.deepEqual(repoState.state.calls, []);
+});
+
 test("undo: conversation-only checkpoint navigates and restores the prompt", async () => {
   const { store, run, repoState } = setup();
   store.add(makeCheckpoint({ files: [] }));

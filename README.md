@@ -28,9 +28,16 @@ restart.
   blocking pi behind a minutes-long first `git add`. A turn that begins
   while a capture is still running gets no second capture rather than
   stacking overlapping git runs.
+- **Baseline warmup.** A snapshot is taken in the background at session
+  start, so the first message's capture is an incremental diff instead of
+  a cold full enumeration.
 - **Housekeeping is automatic.** Daily gc keeps the snapshot store bounded,
   a background gc runs every 20 captures, and stores whose workspace no
   longer exists are swept at session start.
+- **Messages older than pi-undo can still be removed.** If the last message
+  has no checkpoint (it predates arming in this workspace), `/undo` offers
+  to remove it from the conversation without reverting files — those file
+  states were never captured, so they cannot be restored.
 - **Two snapshots per message.** Each user message gets a before and an
   after tree hash. Undo restores only the files that message changed.
 - **Gitignored files are undoable when the session edits them.** The shadow

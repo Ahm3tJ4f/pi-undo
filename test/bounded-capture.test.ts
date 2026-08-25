@@ -307,3 +307,54 @@ test("commands: undo warns and refuses while a capture is in flight", async () =
     "with no capture in flight, undo proceeds to its normal path",
   );
 });
+
+test("bounded capture: a turn starting during warmup gets a transcript-only boundary", async () => {
+  const h = makeHarness({ trackQueue: [], deadlineMs: 100 });
+  const warmCalls: string[] = [];
+  let release!: (value: string | undefined) => void;
+  const held = new Promise<string | undefined>((resolve) => {
+    release = resolve;
+  });
+  const warmRepo: SnapshotRepo = {
+    storeDir: "/tmp/warm",
+    async ensure() {},
+    async track() {
+      warmCalls.push("warm-track");
+      return held;
+    },
+    async changedFiles() {
+      return ["w.txt"];
+    },
+    async dirtySinceAll() {
+      return { manual: [], ignored: [] };
+    },
+    async restoreSnapshot() {
+      return { skipped: [], excluded: [], manualSkipped: [] };
+    },
+    async verifySnapshot() {
+      return true;
+    },
+    async diffNumstat() {
+      return { rows: [], binaryCount: 0 };
+    },
+    async gcIfDue() {},
+  };
+
+  h.controller.warmup(warmRepo, "/tmp/somewhere");
+  assert.deepEqual(warmCalls, ["warm-track"], "warmup begins its capture");
+
+  const ctx = h.baseCtx();
+  await h.emit("before_agent_start", { prompt: "early turn", images: [] }, ctx);
+  await h.emit("message_start", { message: { role: "assistant" } }, ctx);
+  await h.emit("agent_settled", {}, ctx);
+  assert.equal(h.store.get("u1"), undefined, "nothing recorded while the warmup churns");
+
+  release("warm-baseline");
+  await flush(150);
+  assert.equal(
+    h.store.get("u1"),
+    undefined,
+    "the racing turn adopted no capture and records no checkpoint",
+  );
+  assert.deepEqual(h.calls, [], "no second capture stacked on the warmup");
+});

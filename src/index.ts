@@ -35,6 +35,12 @@ export default function (pi: ExtensionAPI): void {
       ctx.ui.notify(`pi-undo: snapshot store unavailable: ${errorMessage(error)}`, "warning")
     }
 
+    // Baseline warmup: snapshot now so the FIRST turn's pre-turn capture is
+    // an incremental diff instead of a cold full enumeration (minutes in a
+    // home directory). Goes through the churn registry, so a prompt sent
+    // before it settles adopts it rather than stacking a second capture.
+    captures.warmup(snap, ctx.cwd)
+
     // Housekeeping ported from omp-undo-redo#54: drop shadow stores whose
     // workspace no longer exists. Fire-and-forget — never inside the
     // session-start critical path.

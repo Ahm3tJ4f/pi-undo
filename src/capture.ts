@@ -42,6 +42,14 @@ export interface CaptureController {
   /** Bounded wait used by /undo, /redo and /diff so a command never blocks
    *  behind a huge first capture longer than the deadline. */
   waitForPending(cwd: string): Promise<{ settled: boolean }>
+  /** Starts a background baseline capture at session start, through the
+   *  same churn registry as turn captures. The first real turn then diffs
+   *  incrementally against it instead of enumerating a cold workspace
+   *  (minutes in a home directory). If the user prompts before it settles,
+   *  that turn runs with no capture of its own (the stacking guard) and
+   *  its undo falls back to transcript-only — adopting someone else's
+   *  in-flight tree as a baseline could mis-attribute edits. */
+  warmup(git: SnapshotRepo, cwd: string): void
 }
 
 export interface ActiveTurn {
@@ -261,6 +269,12 @@ export function setupCapture(
     }
   }
 
+  function warmupCapture(git: SnapshotRepo, rawCwd: string): void {
+    const key = canonicalizePath(rawCwd)
+    if (pendingByCwd.has(key)) return
+    beginCapture(() => git.track(), key, pendingByCwd)
+  }
+
   const controller: CaptureController = {
     waitForPending: async (cwd) => {
       const pending = pendingByCwd.get(canonicalizePath(cwd))
@@ -268,6 +282,7 @@ export function setupCapture(
       const outcome = await withDeadline(pending.complete, deadlineMs())
       return { settled: outcome !== "timed-out" }
     },
+    warmup: warmupCapture,
   }
   return controller
 }
