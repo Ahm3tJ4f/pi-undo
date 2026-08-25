@@ -28,19 +28,6 @@ export interface RevertState {
   revertedEntryIds: string[]
 }
 
-export interface ActiveTurn {
-  prompt: string
-  imageCount: number
-  
-  userEntryId: string | null
-  beforeLeafId: string | null
-  beforeSnapshot: string | null
-  
-  touched: Map<string, number>
-  
-  startAt: number
-}
-
 export type UserMessageEntry = Extract<SessionEntry, { type: "message" }> & {
   message: { role: "user" }
 }

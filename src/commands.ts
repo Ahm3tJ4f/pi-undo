@@ -150,6 +150,17 @@ async function ensureIdle(ctx: ExtensionCommandContext): Promise<void> {
   await ctx.waitForIdle()
 }
 
+// A huge first-ever capture can still be churning when the user reaches for
+// /undo. Wait for it up to the configured deadline; refuse politely rather
+// than blocking the command behind a minutes-long `git add`.
+async function ensureNotCapturing(deps: CaptureDeps, ctx: ExtensionCommandContext, name: string): Promise<boolean> {
+  if (!deps.waitForCapture) return true
+  const { settled } = await deps.waitForCapture(ctx.cwd)
+  if (settled) return true
+  ctx.ui.notify(`Cannot ${name} while the file checkpoint is still being captured; try again shortly.`, "warning")
+  return false
+}
+
 interface SnapshotChanges {
   before: string
   after: string
@@ -162,8 +173,8 @@ function snapshotChanges(checkpoint: Checkpoint): SnapshotChanges | null {
 }
 
 async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCommandContext): Promise<void> {
+  if (!(await ensureNotCapturing(deps, ctx, "undo"))) return
   await ensureIdle(ctx)
-
   const checkpoint = store.latestOnBranch(ctx.sessionManager.getBranch())
   if (!checkpoint) {
     ctx.ui.notify("Nothing to undo", "info")
@@ -338,6 +349,7 @@ async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
 }
 
 async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCommandContext): Promise<void> {
+  if (!(await ensureNotCapturing(deps, ctx, "redo"))) return
   await ensureIdle(ctx)
 
   const checkpoint = store.peekReverted()
@@ -501,6 +513,7 @@ async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
 }
 
 async function diff(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCommandContext): Promise<void> {
+  if (!(await ensureNotCapturing(deps, ctx, "diff"))) return
   await ensureIdle(ctx)
 
   const checkpoint: Checkpoint | undefined = store.latestOnBranch(ctx.sessionManager.getBranch())

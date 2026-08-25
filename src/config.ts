@@ -4,17 +4,19 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent"
 
 export interface PiUndoConfig {
   excludeDirectories: string[]
-  maxFiles: number
 }
-
-export const DEFAULT_MAX_FILES = 100_000
 
 // Matched at any depth in every project. These are regenerated or app-owned,
 // never worth snapshotting: dependencies, build output, tool caches. Entries
 // are full gitignore glob patterns: plain names match at any depth, globs are
 // supported (for example "**/build-*" or "*.tmp"), and a trailing slash
 // means the pattern matches directories only, as in gitignore.
+//
+// ".pi" keeps the agent's own state directory out of snapshots: when pi runs
+// in a home directory the snapshot store lives inside the worktree, and a
+// capture that swallowed it would chase its own growing output forever.
 export const DEFAULT_EXCLUDE_DIRECTORIES: string[] = [
+  ".pi",
   "node_modules",
   "Pods",
   "vendor",
@@ -70,7 +72,6 @@ export const DEFAULT_EXCLUDE_DIRECTORIES: string[] = [
 
 export const DEFAULT_CONFIG: PiUndoConfig = {
   excludeDirectories: DEFAULT_EXCLUDE_DIRECTORIES,
-  maxFiles: DEFAULT_MAX_FILES,
 }
 
 /**
@@ -82,7 +83,9 @@ export const DEFAULT_CONFIG: PiUndoConfig = {
  * complete effective configuration: removing an entry from
  * excludeDirectories really un-excludes that directory.
  *
- * If a key is missing or invalid, the default for that key is used.
+ * If a key is missing or invalid, the default for that key is used. Unknown
+ * keys (for example a stale "maxFiles" left by an older install) are ignored;
+ * there is no snapshot size cap anymore.
  */
 export function loadPiUndoConfig(globalPath?: string): PiUndoConfig {
   const file = globalPath ?? path.join(getAgentDir(), "pi-undo.json")
@@ -90,7 +93,6 @@ export function loadPiUndoConfig(globalPath?: string): PiUndoConfig {
   const config = readConfigFile(file)
   return {
     excludeDirectories: config.excludeDirectories ?? DEFAULT_EXCLUDE_DIRECTORIES,
-    maxFiles: config.maxFiles ?? DEFAULT_MAX_FILES,
   }
 }
 
@@ -112,13 +114,8 @@ function readConfigFile(file: string): Partial<PiUndoConfig> {
           (value): value is string => typeof value === "string" && value.length > 0,
         )
       : undefined
-    const maxFiles =
-      typeof raw.maxFiles === "number" && Number.isFinite(raw.maxFiles) && raw.maxFiles > 0
-        ? raw.maxFiles
-        : undefined
     return {
       ...(excludeDirectories !== undefined ? { excludeDirectories } : {}),
-      ...(maxFiles !== undefined ? { maxFiles } : {}),
     }
   } catch {
     return {}

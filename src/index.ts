@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { setupCapture, type CaptureDeps } from "./capture.ts"
 import { registerCommands } from "./commands.ts"
 import { loadPiUndoConfig } from "./config.ts"
-import { ShadowGit } from "./git.ts"
+import { evictStaleStores, ShadowGit } from "./git.ts"
 import { CheckpointStore } from "./store.ts"
 import { errorMessage } from "./util.ts"
 
@@ -22,6 +22,9 @@ export default function (pi: ExtensionAPI): void {
     },
   }
 
+  const captures = setupCapture(pi, store, deps)
+  deps.waitForCapture = (cwd) => captures.waitForPending(cwd)
+
   pi.on("session_start", async (_event, ctx) => {
     store.load(ctx.sessionManager)
     const snap = deps.getGit(ctx)
@@ -31,12 +34,16 @@ export default function (pi: ExtensionAPI): void {
     } catch (error) {
       ctx.ui.notify(`pi-undo: snapshot store unavailable: ${errorMessage(error)}`, "warning")
     }
+
+    // Housekeeping ported from omp-undo-redo#54: drop shadow stores whose
+    // workspace no longer exists. Fire-and-forget — never inside the
+    // session-start critical path.
+    void evictStaleStores().catch(() => {})
   })
 
   pi.on("session_shutdown", () => {
     git = undefined
   })
 
-  setupCapture(pi, store, deps)
   registerCommands(pi, store, deps)
 }
