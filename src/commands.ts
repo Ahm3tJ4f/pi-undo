@@ -582,6 +582,16 @@ async function diff(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCom
       })
       message += `\n\nChanged during the message by other sources (not restored by /undo):\n${lines.join("\n")}`
     }
+    // Append the real unified diff (truncated: notify is a toast, not a
+    // scrollable viewer). The numstat summary above stays as the header.
+    const patch = await git.diffPatch(changes.before, changes.after)
+    if (patch) {
+      const full =
+        patch.length > 2000
+          ? `${patch.slice(0, 2000)}\n...(diff truncated, run git diff for full output)`
+          : patch
+      message += `\n\n${full}`
+    }
     ctx.ui.notify(message, "info")
   } catch (error) {
     ctx.ui.notify(`Preview failed: ${errorMessage(error)}`, "error")

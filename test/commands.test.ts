@@ -75,6 +75,7 @@ function makeRepo(storeDir = "/tmp/fake-store"): {
     ignored: string[];
     verify: (snapshot: string) => boolean;
     numstat: NumstatRow[];
+    diffPatch: string;
     skipped: string[];
     excluded: string[];
     manualSkipped: string[];
@@ -88,6 +89,7 @@ function makeRepo(storeDir = "/tmp/fake-store"): {
     ignored: [] as string[],
     verify: (_snapshot: string) => true,
     numstat: [] as NumstatRow[],
+    diffPatch: "--- a/file\n+++ b/file\n@@ -1 +1 @@",
     skipped: [] as string[],
     excluded: [] as string[],
     manualSkipped: [] as string[],
@@ -122,6 +124,10 @@ function makeRepo(storeDir = "/tmp/fake-store"): {
     async diffNumstat() {
       state.calls.push("diffNumstat");
       return { rows: state.numstat, binaryCount: 0 };
+    },
+    async diffPatch() {
+      state.calls.push("diffPatch");
+      return state.diffPatch;
     },
     async gcIfDue() {
       state.calls.push("gcIfDue");
@@ -508,6 +514,17 @@ test("diff: shows the preview of what undo would restore", async () => {
   await run("diff", ctx);
   assert.match(ui.notifications[0]!, /a\.txt/);
   assert.match(ui.notifications[0]!, /\+12\/-3/);
+});
+test("diff: appends a unified patch to the notification", async () => {
+  const { store, repoState, run } = setup();
+  store.add(makeCheckpoint({}));
+  repoState.state.numstat = [{ file: "a.txt", added: 12, removed: 3 }];
+  repoState.state.diffPatch = "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n";
+  const { ctx, ui } = sessionCtx([makeEntry("u1", "user", "l0")]);
+  await run("diff", ctx);
+  assert.ok(repoState.state.calls.includes("diffPatch"), "diffPatch is invoked");
+  assert.match(ui.notifications[0]!, /a\.txt/);
+  assert.match(ui.notifications[0]!, /@@/);
 });
 
 test("diff: reports when the last message changed no files", async () => {

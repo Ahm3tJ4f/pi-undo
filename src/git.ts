@@ -87,6 +87,7 @@ export interface SnapshotRepo {
   ): Promise<RestoreResult>
   verifySnapshot(snapshot: string, exclude?: string[]): Promise<boolean>
   diffNumstat(from: string, to: string): Promise<DiffStatResult>
+  diffPatch(from: string, to: string): Promise<string>
   gcIfDue(): Promise<void>
 }
 
@@ -392,6 +393,15 @@ export class ShadowGit implements SnapshotRepo {
       rows.push({ file: normalizeGitPath(file) ?? file, added: a, removed: r })
     }
     return { rows, binaryCount }
+  }
+  async diffPatch(from: string, to: string): Promise<string> {
+    await this.ensure()
+    const result = await this.git(
+      ["diff", "--no-ext-diff", "--no-renames", from, to, "--", ".", ...PI_EXCLUDE],
+      { allowFailure: true },
+    )
+    if (result.code !== 0) return ""
+    return result.stdout.trim()
   }
 
   async gcIfDue(): Promise<void> {
@@ -713,13 +723,18 @@ export class ShadowGit implements SnapshotRepo {
     // info/exclude feeds git's own ignore matching for the manual-edit guard:
     // it must cover the source repo's local excludes too, so manual edits to
     // any gitignored file never block undo.
-    const lines: string[] = text ? text.split("\n") : []
-    lines.push(...configLines, ...largeLines, ...storeLines)
+    // The source repo's own info/exclude is mirrored into both exclude files:
+    // info/exclude (git's manual-edit guard) needs it, and the snapshot-side
+    // pi-undo-exclude must match so staging filters honor the same local
+    // excludes OpenCode's sync() applies.
+    const sourceLines = text ? text.split("\n") : []
+    const lines: string[] = [...sourceLines, ...configLines, ...largeLines, ...storeLines]
     await mkdir(path.join(this.gitdir, "info"), { recursive: true })
     await writeFile(path.join(this.gitdir, "info", "exclude"), lines.join("\n") + "\n")
-    // pi-undo-exclude feeds the snapshot side (staging filters): only
-    // pi-undo's own patterns, never the project's gitignore rules.
-    await writeFile(this.excludeFile(), [...configLines, ...largeLines, ...storeLines].join("\n") + "\n")
+    // pi-undo-exclude feeds the snapshot side (staging filters): pi-undo's
+    // own patterns plus the source repo's local excludes, never the
+    // project's gitignore rules.
+    await writeFile(this.excludeFile(), [...sourceLines, ...configLines, ...largeLines, ...storeLines].join("\n") + "\n")
   }
 
   // Removes from the index any tracked file that a pi-undo exclude rule

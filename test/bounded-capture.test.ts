@@ -76,6 +76,9 @@ function makeHarness(options: HarnessOptions) {
       return { rows: [], binaryCount: 0 };
     },
     async gcIfDue() {},
+    async diffPatch() {
+      return "";
+    },
   };
   const deps: CaptureDeps & { captureDeadlineMs?: number } = {
     getGit: () => repo,
@@ -264,6 +267,9 @@ test("commands: undo warns and refuses while a capture is in flight", async () =
       return { rows: [], binaryCount: 0 };
     },
     async gcIfDue() {},
+    async diffPatch() {
+      return "";
+    },
   };
   let inFlight = true;
   const deps: CaptureDeps = {
@@ -338,6 +344,9 @@ test("bounded capture: a turn starting during warmup gets a transcript-only boun
       return { rows: [], binaryCount: 0 };
     },
     async gcIfDue() {},
+    async diffPatch() {
+      return "";
+    },
   };
 
   h.controller.warmup(warmRepo, "/tmp/somewhere");
