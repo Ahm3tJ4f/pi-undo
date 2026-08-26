@@ -117,7 +117,7 @@ test("tracks, diffs and verifies in a non-git directory", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
-test("syncExcludes mirrors the source repo's info/exclude into both exclude files", async () => {
+test("syncExcludes mirrors the source repo's info/exclude into the shadow's info/exclude only", async () => {
   const dir = await newTempDir("pi-undo-source-exclude-");
   try {
     await makeSourceRepo(dir, { "a.txt": "one\n" });
@@ -131,8 +131,8 @@ test("syncExcludes mirrors the source repo's info/exclude into both exclude file
 
     const exclude = await readFile(path.join(git.storeDir, "info", "exclude"), "utf8");
     const piExclude = await readFile(path.join(git.storeDir, "info", "pi-undo-exclude"), "utf8");
-    assert.ok(exclude.includes("my-excluded-file.txt"), "info/exclude mirrors the source exclude");
-    assert.ok(piExclude.includes("my-excluded-file.txt"), "pi-undo-exclude mirrors the source exclude");
+    assert.ok(exclude.includes("my-excluded-file.txt"), "info/exclude mirrors the source exclude (manual-edit guard)");
+    assert.ok(!piExclude.includes("my-excluded-file.txt"), "pi-undo-exclude does NOT mirror source excludes (staging filter keeps ignored files undoable)");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -675,16 +675,18 @@ test("source repo info/exclude files are snapshotted when the session edits them
     const git = await newShadow(dir);
     const before = await tracked(git);
 
-    // A file listed in the source repo's info/exclude is mirrored into the
-    // shadow's excludes (parity with OpenCode): it is NOT snapshotted.
+    // The session creates the locally-excluded file: it is snapshotted, so
+    // the edit is undoable. Source info/exclude feeds the manual-edit guard
+    // (info/exclude) but NOT the staging filter (pi-undo-exclude) — pi-undo
+    // deliberately tracks gitignored files so session edits to them undo.
     await writeFile(path.join(dir, "secret.tmp"), "nope\n");
     await writeFile(path.join(dir, "b.txt"), "two\n");
     const after = await tracked(git);
 
-    assert.deepEqual((await git.changedFiles(before, after)).sort(), ["b.txt"]);
-    // Manual edits to a tracked file are still reported.
-    await writeFile(path.join(dir, "b.txt"), "manual\n");
-    assert.deepEqual((await git.dirtySinceAll(after)).manual, ["b.txt"]);
+    assert.deepEqual((await git.changedFiles(before, after)).sort(), ["b.txt", "secret.tmp"]);
+    // Manual edits to it still never block undo.
+    await writeFile(path.join(dir, "secret.tmp"), "manual\n");
+    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
