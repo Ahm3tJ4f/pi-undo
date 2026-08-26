@@ -117,6 +117,26 @@ test("tracks, diffs and verifies in a non-git directory", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+test("syncExcludes mirrors the source repo's info/exclude into the shadow's info/exclude only", async () => {
+  const dir = await newTempDir("pi-undo-source-exclude-");
+  try {
+    await makeSourceRepo(dir, { "a.txt": "one\n" });
+    // A custom local exclude entry in the source repo's info/exclude.
+    await mkdir(path.join(dir, ".git", "info"), { recursive: true });
+    await writeFile(path.join(dir, ".git", "info", "exclude"), "my-excluded-file.txt\n");
+
+    const git = new ShadowGit(fakePi(), dir);
+    await git.ensure();
+    await tracked(git);
+
+    const exclude = await readFile(path.join(git.storeDir, "info", "exclude"), "utf8");
+    const piExclude = await readFile(path.join(git.storeDir, "info", "pi-undo-exclude"), "utf8");
+    assert.ok(exclude.includes("my-excluded-file.txt"), "info/exclude mirrors the source exclude (manual-edit guard)");
+    assert.ok(!piExclude.includes("my-excluded-file.txt"), "pi-undo-exclude does NOT mirror source excludes (staging filter keeps ignored files undoable)");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("verifySnapshot excludes files deliberately left in the index", async () => {
   const dir = await newTempDir("pi-undo-verify-exclude-");
@@ -423,7 +443,6 @@ test("file globs in excludeDirectories exclude files, not only directories", asy
 
     const git = new ShadowGit(fakePi(), dir, undefined, {
       excludeDirectories: ["*.tmp"],
-      maxFiles: 5,
     });
     await git.ensure();
     const before = await tracked(git);
@@ -450,7 +469,6 @@ test("excludeDirectories entries with a trailing slash still match", async () =>
     // pattern must not become "node_modules//", which git never matches.
     const git = new ShadowGit(fakePi(), dir, undefined, {
       excludeDirectories: ["node_modules/"],
-      maxFiles: 5,
     });
     await git.ensure();
     const before = await tracked(git);
@@ -476,7 +494,6 @@ test("stale tracked files under excluded dirs are dropped from the index", async
     // before nested excludeDirectories worked.
     const lax = new ShadowGit(fakePi(), dir, undefined, {
       excludeDirectories: [],
-      maxFiles: 5,
     });
     await lax.ensure();
     await lax.track();
@@ -588,7 +605,6 @@ test("restore skips files that became config-excluded and keeps manual edits", a
     await writeFile(path.join(dir, "out.log"), "manual edit\n");
     const strict = new ShadowGit(fakePi(), dir, undefined, {
       excludeDirectories: ["*.log"],
-      maxFiles: 5,
     });
     await strict.ensure();
 
@@ -660,7 +676,9 @@ test("source repo info/exclude files are snapshotted when the session edits them
     const before = await tracked(git);
 
     // The session creates the locally-excluded file: it is snapshotted, so
-    // the edit is undoable.
+    // the edit is undoable. Source info/exclude feeds the manual-edit guard
+    // (info/exclude) but NOT the staging filter (pi-undo-exclude) — pi-undo
+    // deliberately tracks gitignored files so session edits to them undo.
     await writeFile(path.join(dir, "secret.tmp"), "nope\n");
     await writeFile(path.join(dir, "b.txt"), "two\n");
     const after = await tracked(git);
@@ -941,7 +959,6 @@ test("config: file is created with defaults when missing", async () => {
     const configFile = path.join(dir, "pi-undo.json");
     const config = loadPiUndoConfig(configFile);
     assert.ok(config.excludeDirectories.includes("node_modules"));
-    assert.equal(config.maxFiles, 100000);
 
     const raw = JSON.parse(await readFile(configFile, "utf8")) as {
       excludeDirectories?: unknown;
@@ -952,23 +969,18 @@ test("config: file is created with defaults when missing", async () => {
         raw.excludeDirectories.includes("node_modules"),
       "created file contains the default excludes",
     );
-    assert.equal(raw.maxFiles, 100000);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("config: user edits to excludeDirectories and maxFiles are honored", async () => {
+test("config: user edits to excludeDirectories are honored", async () => {
   const dir = await newTempDir("pi-undo-config-edit-");
   try {
     const configFile = path.join(dir, "pi-undo.json");
-    await writeFile(
-      configFile,
-      JSON.stringify({ excludeDirectories: ["Downloads", "tmp"], maxFiles: 7 }),
-    );
+    await writeFile(configFile, JSON.stringify({ excludeDirectories: ["Downloads", "tmp"] }));
     const config = loadPiUndoConfig(configFile);
     assert.deepEqual(config.excludeDirectories, ["Downloads", "tmp"]);
-    assert.equal(config.maxFiles, 7);
 
     // A directory named in the file is excluded from snapshots.
     await mkdir(path.join(dir, "Downloads"));
@@ -1011,27 +1023,27 @@ test("config: invalid values fall back to defaults", async () => {
   const dir = await newTempDir("pi-undo-config-invalid-");
   try {
     const configFile = path.join(dir, "pi-undo.json");
-    await writeFile(
-      configFile,
-      JSON.stringify({ excludeDirectories: "nope", maxFiles: -3 }),
-    );
+    await writeFile(configFile, JSON.stringify({ excludeDirectories: "nope" }));
     const config = loadPiUndoConfig(configFile);
     assert.ok(config.excludeDirectories.includes("node_modules"));
-    assert.equal(config.maxFiles, 100000);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("file cap skips snapshots with a warning", async () => {
-  const dir = await newTempDir("pi-undo-cap-");
+// The old maxFiles wall skipped snapshots over huge workspaces entirely,
+// leaving undo unarmed exactly where it was needed most. The replacement is
+// incremental staging plus a background capture: size no longer skips
+// anything, so this test now asserts the opposite of its predecessor.
+test("large untracked sets still snapshot (the old file cap is gone)", async () => {
+  const dir = await newTempDir("pi-undo-nocap-");
   try {
-    for (let i = 0; i < 6; i++) {
-      await writeFile(path.join(dir, `f${i}.txt`), "x\n");
+    for (let i = 0; i < 150; i++) {
+      await writeFile(path.join(dir, `f${i}.txt`), `content ${i}\n`);
     }
-    const git = new ShadowGit(fakePi(), dir, undefined, { excludeDirectories: [], maxFiles: 5 });
+    const git = new ShadowGit(fakePi(), dir, undefined, { excludeDirectories: [] });
     await git.ensure();
-    assert.equal(await git.track(), undefined);
+    assert.match((await git.track()) ?? "", /^[0-9a-f]{40}$/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -58,6 +58,9 @@ function makeHarness(options: HarnessOptions = {}) {
       return { rows: [], binaryCount: 0 };
     },
     async gcIfDue() {},
+    async diffPatch() {
+      return "";
+    },
   };
   const deps: CaptureDeps = { getGit: () => repo };
 
@@ -160,6 +163,9 @@ test("capture: failed pre-turn snapshot disables undo for the message", async ()
       return { rows: [], binaryCount: 0 };
     },
     async gcIfDue() {},
+    async diffPatch() {
+      return "";
+    },
   };
   const deps: CaptureDeps = { getGit: () => failing };
   setupCapture(failingPi, store, deps);

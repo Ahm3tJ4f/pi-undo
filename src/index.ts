@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { setupCapture, type CaptureDeps } from "./capture.ts"
 import { registerCommands } from "./commands.ts"
 import { loadPiUndoConfig } from "./config.ts"
-import { ShadowGit } from "./git.ts"
+import { canonicalizePath, evictStaleStores, ShadowGit } from "./git.ts"
 import { CheckpointStore } from "./store.ts"
 import { errorMessage } from "./util.ts"
 
@@ -13,7 +13,7 @@ export default function (pi: ExtensionAPI): void {
   const deps: CaptureDeps = {
     getGit(ctx) {
       const notify = (message: string) => ctx.ui.notify(message, "warning")
-      if (!git || git.cwd !== ctx.cwd) {
+      if (!git || git.cwd !== canonicalizePath(ctx.cwd)) {
         git = new ShadowGit(pi, ctx.cwd, notify, loadPiUndoConfig())
       } else {
         git.setWarn(notify)
@@ -21,6 +21,9 @@ export default function (pi: ExtensionAPI): void {
       return git
     },
   }
+
+  const captures = setupCapture(pi, store, deps)
+  deps.waitForCapture = (cwd) => captures.waitForPending(cwd)
 
   pi.on("session_start", async (_event, ctx) => {
     store.load(ctx.sessionManager)
@@ -31,12 +34,22 @@ export default function (pi: ExtensionAPI): void {
     } catch (error) {
       ctx.ui.notify(`pi-undo: snapshot store unavailable: ${errorMessage(error)}`, "warning")
     }
+
+    // Baseline warmup: snapshot now so the FIRST turn's pre-turn capture is
+    // an incremental diff instead of a cold full enumeration (minutes in a
+    // home directory). Goes through the churn registry, so a prompt sent
+    // before it settles adopts it rather than stacking a second capture.
+    captures.warmup(snap, ctx.cwd)
+
+    // Housekeeping ported from omp-undo-redo#54: drop shadow stores whose
+    // workspace no longer exists. Fire-and-forget — never inside the
+    // session-start critical path.
+    void evictStaleStores().catch(() => {})
   })
 
   pi.on("session_shutdown", () => {
     git = undefined
   })
 
-  setupCapture(pi, store, deps)
   registerCommands(pi, store, deps)
 }

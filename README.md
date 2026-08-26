@@ -22,11 +22,22 @@ restart.
 - **Works without git.** Non-git directories are fully supported.
 - **Fast on big repos.** Object reuse via git alternates, incremental adds,
   batched restores. No full `git add` twice per turn.
-- **Garbage collection.** Daily gc keeps the snapshot store bounded. Old
-  snapshots get pruned, so storage doesn't grow forever.
-- **Cancel and failures are safe.** Cancel mid-undo rolls the files back.
-  Restores are verified by tree hash and roll back on mismatch. Manual
-  edits trigger a question first, so nothing gets clobbered.
+- **Huge workspaces still get undo.** There is no snapshot size cap. The
+  pre-turn capture runs in the background: the turn starts immediately, and
+  `/undo` waits (bounded) for a capture that is still settling instead of
+  blocking pi behind a minutes-long first `git add`. A turn that begins
+  while a capture is still running gets no second capture rather than
+  stacking overlapping git runs.
+- **Baseline warmup.** A snapshot is taken in the background at session
+  start, so the first message's capture is an incremental diff instead of
+  a cold full enumeration.
+- **Housekeeping is automatic.** Daily gc keeps the snapshot store bounded,
+  a background gc runs every 20 captures, and stores whose workspace no
+  longer exists are swept at session start.
+- **Messages older than pi-undo can still be removed.** If the last message
+  has no checkpoint (it predates arming in this workspace), `/undo` offers
+  to remove it from the conversation without reverting files — those file
+  states were never captured, so they cannot be restored.
 - **Two snapshots per message.** Each user message gets a before and an
   after tree hash. Undo restores only the files that message changed.
 - **Gitignored files are undoable when the session edits them.** The shadow
@@ -49,21 +60,19 @@ restart.
 
 pi-undo reads one config file: `~/.pi/agent/pi-undo.json`. On the first run
 the file is created with the default values, and you edit it directly to
-change them. Add or remove patterns in `excludeDirectories`, or change
-`maxFiles`. The list in the file is the complete list: removing an entry
-really un-excludes that path.
+change them. Add or remove patterns in `excludeDirectories`. The list in
+the file is the complete list: removing an entry really un-excludes that
+path. A stale `maxFiles` key from an older install is ignored.
 
 ```json
 {
-  "excludeDirectories": ["node_modules", "dist", "Downloads", "tmp"],
-  "maxFiles": 100000
+  "excludeDirectories": ["node_modules", "dist", "Downloads", "tmp"]
 }
 ```
 
 | Field | What it does |
 | -------- | ------------ |
 | `excludeDirectories` | Full gitignore glob patterns, never snapshotted. Plain names match at any depth; globs like `**/build-*` or `*.tmp` work; a trailing slash means directories only |
-| `maxFiles` | Snapshot size cap (default 100000). Over this, snapshots are skipped for that message with a one-time warning instead of making pi slow |
 
 ## Commands
 

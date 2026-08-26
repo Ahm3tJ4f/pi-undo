@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import { existsSync } from "node:fs"
+import { existsSync, realpathSync, rmSync, statSync, unlinkSync } from "node:fs"
 import type { Dirent } from "node:fs"
 import { copyFile, lstat, mkdir, readFile, readdir, rm, stat as fsStat, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
@@ -16,6 +16,22 @@ const PRUNE = "7.days"
 
 const BATCH = 100
 const GIT_TIMEOUT = 120_000
+
+// Staging a first-ever capture over a huge worktree can legitimately run
+// for minutes. Those calls happen outside any turn handler (bounded
+// capture), so give them a generous ceiling instead of killing git
+// mid-write, which would strand an index.lock behind.
+export const ADD_TIMEOUT = 600_000
+
+// Remove a shadow index.lock left behind by a git process that was killed
+// mid-run (machine sleep, forced exit). Locks younger than this are left
+// alone: another live pi session may legitimately hold them.
+const LOCK_STALE_MS = 10 * 60 * 1000
+
+// Housekeeping thresholds ported from omp-undo-redo#54: a background
+// `git gc` every N captures, and startup eviction of stores whose
+// workspace no longer exists.
+export const GC_AFTER_CAPTURES = 20
 const GC_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 const PI_EXCLUDE: string[] = [":(exclude).pi", ":(exclude,glob)**/.pi/**"]
@@ -32,6 +48,7 @@ interface GitResult {
 
 interface GitOptions {
   allowFailure?: boolean
+  timeout?: number | undefined
 }
 
 interface StoreMeta {
@@ -70,6 +87,7 @@ export interface SnapshotRepo {
   ): Promise<RestoreResult>
   verifySnapshot(snapshot: string, exclude?: string[]): Promise<boolean>
   diffNumstat(from: string, to: string): Promise<DiffStatResult>
+  diffPatch(from: string, to: string): Promise<string>
   gcIfDue(): Promise<void>
 }
 
@@ -81,7 +99,7 @@ export class ShadowGit implements SnapshotRepo {
   private initialized = false
   private warn: (message: string) => void
   private warnedExcludes = ""
-  private warnedSkip = false
+  private capturesSinceGc = 0
 
   constructor(
     pi: Pick<ExtensionAPI, "exec">,
@@ -90,11 +108,16 @@ export class ShadowGit implements SnapshotRepo {
     config: PiUndoConfig = DEFAULT_CONFIG,
   ) {
     this.pi = pi
-    this.cwd = cwd
+    // Canonicalize once: every store key and path comparison derives from
+    // this. Without it, a workspace spelled in Windows 8.3 short form (or
+    // reached through a differing symlink) hashes to a second shadow store,
+    // and checkpoints recorded against one store fail tree lookups in the
+    // other ("snapshot tree not found").
+    this.cwd = canonicalizePath(cwd)
     this.warn = warn
     this.config = config
-    const key = createHash("sha256").update(cwd).digest("hex").slice(0, 24)
-    this.gitdir = path.join(snapshotStoreRoot(), key)
+    const key = createHash("sha256").update(this.cwd).digest("hex").slice(0, 24)
+    this.gitdir = path.join(canonicalizePath(snapshotStoreRoot()), key)
   }
 
   setWarn(warn: (message: string) => void): void {
@@ -103,6 +126,19 @@ export class ShadowGit implements SnapshotRepo {
 
   get storeDir(): string {
     return this.gitdir
+  }
+
+  // A git process killed mid-add strands index.lock and every later git
+  // call fails until it is removed. Clear only provably dead locks.
+  private clearStaleLock(): void {
+    const lock = path.join(this.gitdir, "index.lock")
+    try {
+      if (!existsSync(lock)) return
+      if (Date.now() - statSync(lock).mtimeMs < LOCK_STALE_MS) return
+      unlinkSync(lock)
+    } catch {
+      // Best effort: a live lock survives; git surfaces it on the next call.
+    }
   }
 
   async ensure(): Promise<void> {
@@ -128,16 +164,32 @@ export class ShadowGit implements SnapshotRepo {
         await this.git(args, { allowFailure: true })
       }
       await this.seed()
+      // The exclude files exist from the very first moment so the snapshot
+      // store can never become a capture subject (the home-directory
+      // case), even before any track has run.
+      await this.syncExcludes()
     }
+    this.clearStaleLock()
     await this.writeMeta({ updatedAt: Date.now() })
     this.initialized = true
   }
 
   async track(): Promise<string | undefined> {
     await this.ensure()
-    if (!(await this.add())) return undefined
+    await this.add()
     const result = await this.git(["write-tree"])
-    return result.stdout.trim()
+    const tree = result.stdout.trim()
+    if (tree) {
+      this.capturesSinceGc += 1
+      if (this.capturesSinceGc >= GC_AFTER_CAPTURES) {
+        this.capturesSinceGc = 0
+        // Fire-and-forget: a slow gc must never sit inside a turn handler's
+        // deadline budget. A concurrent capture makes the gc fail on its
+        // lock (allowFailure), which just defers it to the next threshold.
+        void this.gc().catch(() => {})
+      }
+    }
+    return tree || undefined
   }
 
   async changedFiles(from: string, to: string): Promise<string[]> {
@@ -342,11 +394,24 @@ export class ShadowGit implements SnapshotRepo {
     }
     return { rows, binaryCount }
   }
+  async diffPatch(from: string, to: string): Promise<string> {
+    await this.ensure()
+    const result = await this.git(
+      ["diff", "--no-ext-diff", "--no-renames", from, to, "--", ".", ...PI_EXCLUDE],
+      { allowFailure: true },
+    )
+    if (result.code !== 0) return ""
+    return result.stdout.trim()
+  }
 
   async gcIfDue(): Promise<void> {
     await this.ensure()
     const meta = await this.readMeta()
     if (meta.lastGcAt !== undefined && Date.now() - meta.lastGcAt < GC_INTERVAL_MS) return
+    await this.gc()
+  }
+
+  private async gc(): Promise<void> {
     const result = await this.git(["gc", `--prune=${PRUNE}`], { allowFailure: true })
     if (result.code !== 0) return
     await this.writeMeta({ lastGcAt: Date.now() })
@@ -356,7 +421,7 @@ export class ShadowGit implements SnapshotRepo {
     const result = await this.pi.exec(
       "git",
       ["--git-dir", this.gitdir, "--work-tree", this.cwd, ...args],
-      { cwd: this.cwd, timeout: GIT_TIMEOUT },
+      { cwd: this.cwd, timeout: opts.timeout ?? GIT_TIMEOUT },
     )
     if (!opts.allowFailure && result.code !== 0) {
       throw new Error(`git ${args[0] ?? ""} failed: ${result.stderr.trim() || `exit ${result.code}`}`)
@@ -415,7 +480,7 @@ export class ShadowGit implements SnapshotRepo {
     return false
   }
 
-  private async add(): Promise<boolean> {
+  private async add(): Promise<void> {
     const meta = await this.readMeta()
     const largeExcludes = meta.largeExcludes ?? []
     await this.syncExcludes(largeExcludes)
@@ -442,7 +507,7 @@ export class ShadowGit implements SnapshotRepo {
       .map(normalizeGitPath)
       .filter((f): f is string => Boolean(f))
     const all = unique([...changedList, ...untrackedList])
-    if (all.length === 0) return true
+    if (all.length === 0) return
 
     const nested = new Set<string>()
     for (const file of all) {
@@ -459,18 +524,8 @@ export class ShadowGit implements SnapshotRepo {
       this.warnedExcludes = ""
     }
     const allowAll = all.filter((file) => !nested.has(file))
-    if (allowAll.length === 0) return true
+    if (allowAll.length === 0) return
 
-    const maxFiles = this.config.maxFiles
-    if (allowAll.length > maxFiles) {
-      if (!this.warnedSkip) {
-        this.warnedSkip = true
-        this.warn(
-          `pi-undo: ${allowAll.length} files to snapshot exceeds the limit (${maxFiles}); snapshots are skipped for this message. Edit excludeDirectories in pi-undo.json or raise maxFiles.`,
-        )
-      }
-      return false
-    }
 
     const untrackedSet = new Set(untrackedList)
     const large = await this.findLargeFiles(allowAll.filter((file) => untrackedSet.has(file)))
@@ -481,7 +536,6 @@ export class ShadowGit implements SnapshotRepo {
     }
 
     await this.stagePaths(allowAll.filter((file) => !large.has(file)))
-    return true
   }
 
   private async checkIgnored(files: string[]): Promise<Set<string>> {
@@ -511,18 +565,18 @@ export class ShadowGit implements SnapshotRepo {
   private async stagePaths(files: string[]): Promise<void> {
     if (files.length === 0) return
     // -f: gitignored files are snapshotted too, and plain "git add" skips them.
-    if (await this.tryPathspec(["add", "-f", "--all", "--sparse"], files)) return
+    if (await this.tryPathspec(["add", "-f", "--all", "--sparse"], files, ADD_TIMEOUT)) return
 
     const failed: string[] = []
     for (const file of files) {
-      if (!(await this.tryPathspec(["add", "-f", "--all", "--sparse"], [file]))) failed.push(file)
+      if (!(await this.tryPathspec(["add", "-f", "--all", "--sparse"], [file], ADD_TIMEOUT))) failed.push(file)
     }
     if (failed.length > 0) {
       this.warn(`pi-undo: could not stage ${failed.length} path(s) for snapshot: ${failed.join(", ")}`)
     }
   }
 
-  private async tryPathspec(command: string[], files: string[]): Promise<boolean> {
+  private async tryPathspec(command: string[], files: string[], timeout?: number): Promise<boolean> {
     if (files.length === 0) return true
     const specFile = path.join(
       tmpdir(),
@@ -532,7 +586,7 @@ export class ShadowGit implements SnapshotRepo {
     try {
       const result = await this.git(
         [...command, `--pathspec-from-file=${specFile}`, "--pathspec-file-nul"],
-        { allowFailure: true },
+        { allowFailure: true, timeout },
       )
       return result.code === 0
     } finally {
@@ -648,6 +702,16 @@ export class ShadowGit implements SnapshotRepo {
     // (github/<repo>/node_modules/...), so a root-anchored /node_modules/
     // would let every one of those nested copies into the snapshot.
     const configLines = this.config.excludeDirectories.map((name) => name.replaceAll("\\", "/"))
+    // The snapshot store itself is never a snapshot subject: when pi runs
+    // with its state directory inside the workspace (the home-directory
+    // case), a capture that swallowed it would chase its own growing
+    // output forever. Seed the store root as a relative ignore when it
+    // lives in the worktree; skip the entry when it does not.
+    const relStore = path.relative(this.cwd, this.gitdir)
+    const storeLines =
+      relStore && relStore !== "." && !relStore.startsWith("..") && !path.isAbsolute(relStore)
+        ? [`/${relStore.replaceAll("\\", "/")}/`]
+        : []
     // Keep only the large-file excludes that no config pattern covers.
     // Entries covered by a config pattern are redundant; entries covered only
     // by the project's own ignore rules are still needed, because gitignored
@@ -659,13 +723,16 @@ export class ShadowGit implements SnapshotRepo {
     // info/exclude feeds git's own ignore matching for the manual-edit guard:
     // it must cover the source repo's local excludes too, so manual edits to
     // any gitignored file never block undo.
-    const lines: string[] = text ? text.split("\n") : []
-    lines.push(...configLines, ...largeLines)
+    const sourceLines = text ? text.split("\n") : []
+    const lines: string[] = [...sourceLines, ...configLines, ...largeLines, ...storeLines]
     await mkdir(path.join(this.gitdir, "info"), { recursive: true })
     await writeFile(path.join(this.gitdir, "info", "exclude"), lines.join("\n") + "\n")
     // pi-undo-exclude feeds the snapshot side (staging filters): only
-    // pi-undo's own patterns, never the project's gitignore rules.
-    await writeFile(this.excludeFile(), [...configLines, ...largeLines].join("\n") + "\n")
+    // pi-undo's own patterns, never the project's gitignore rules. Source
+    // info/exclude entries stay OUT of the staging filter deliberately —
+    // pi-undo snapshots gitignored files so session edits to them are
+    // undoable (the opposite of OpenCode, by design).
+    await writeFile(this.excludeFile(), [...configLines, ...largeLines, ...storeLines].join("\n") + "\n")
   }
 
   // Removes from the index any tracked file that a pi-undo exclude rule
@@ -726,4 +793,63 @@ export class ShadowGit implements SnapshotRepo {
     const meta = { cwd: this.cwd, ...(await this.readMeta()), ...patch }
     await writeFile(this.metaFile(), JSON.stringify(meta)).catch(() => {})
   }
+}
+
+/** One canonical spelling of a path: the realpath when it exists, the
+ *  resolved absolute path otherwise. Windows 8.3 short names and symlinked
+ *  parents yield different strings for one directory; every store key and
+ *  comparison in pi-undo goes through here so those spellings cannot fork
+ *  the state into two shadow stores. */
+export function canonicalizePath(target: string): string {
+  try {
+    return realpathSync(target)
+  } catch {
+    return path.resolve(target)
+  }
+}
+
+/** Removes stores whose workspace no longer exists (workspaces come and
+ *  go; their shadow repos would otherwise accumulate forever). Best-effort
+ *  and retried; stores without a readable meta.json are kept — eviction
+ *  never guesses. */
+export async function evictStaleStores(root: string = snapshotStoreRoot()): Promise<number> {
+  let entries: Dirent[]
+  try {
+    entries = await readdir(root, { withFileTypes: true })
+  } catch {
+    return 0
+  }
+  let evicted = 0
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    const dir = path.join(root, entry.name)
+    let cwd: unknown
+    try {
+      cwd = (JSON.parse(await readFile(path.join(dir, "meta.json"), "utf8")) as { cwd?: unknown }).cwd
+    } catch {
+      continue
+    }
+    if (typeof cwd !== "string" || cwd.length === 0) continue
+    try {
+      statSync(cwd)
+      continue
+    } catch (error) {
+      // Only a proven-missing workspace makes the store droppable. EIO,
+      // EACCES or ENODEV mean the volume is merely unreachable right now
+      // (VPN down, sleeping disk) — evicting then would destroy undo
+      // history for a workspace that still exists.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue
+    }
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        rmSync(dir, { recursive: true, force: true })
+        evicted++
+        break
+      } catch {
+        // A concurrent git child may still hold the directory; retry.
+        await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)))
+      }
+    }
+  }
+  return evicted
 }

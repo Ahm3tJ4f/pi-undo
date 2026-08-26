@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -57,4 +57,19 @@ test("config: cache patterns match at any depth", () => {
   const matcher = ignore().add(DEFAULT_EXCLUDE_DIRECTORIES);
   assert.ok(matcher.ignores("pkg/__pycache__/x.pyc"));
   assert.ok(matcher.ignores("src/a.pyc"));
+});
+
+test("config: the .pi agent-state directory is excluded by default", () => {
+  assert.ok(DEFAULT_EXCLUDE_DIRECTORIES.includes(".pi"));
+});
+
+test("config: a stale maxFiles key from an older install is ignored", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "pi-undo-config-test-"));
+  const file = path.join(dir, "pi-undo.json");
+  await writeFile(file, JSON.stringify({ maxFiles: 5, excludeDirectories: ["x"] }), "utf8");
+  try {
+    assert.deepEqual(loadPiUndoConfig(file), { excludeDirectories: ["x"] });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
