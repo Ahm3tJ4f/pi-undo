@@ -107,6 +107,16 @@ interface GitResult {
   stderr: string
 }
 
+// The project's own git repository, when the working directory is in one.
+interface SourceRepo {
+  // Directory with this worktree's index.
+  gitDir: string
+  // Directory with the objects; differs from gitDir in linked worktrees.
+  commonDir: string
+  // Path of the working directory inside the repository; "" at the top.
+  prefix: string
+}
+
 interface StoreMeta {
   cwd: string
   updatedAt: number
@@ -133,7 +143,7 @@ export class ShadowGit implements SnapshotRepo {
   private readonly mutex = new Mutex()
   private warn: (message: string) => void
   private ready = false
-  private sourceGitDir: Promise<string | null> | undefined
+  private source: Promise<SourceRepo | null> | undefined
   private exclude: { content: string; matcher: Ignore } | undefined
   private warnedNested = ""
   private warnedCap = false
@@ -294,6 +304,9 @@ export class ShadowGit implements SnapshotRepo {
 
     const large = await this.findLargeFiles(untrackedFiles)
     if (large.length > 0) {
+      this.warn(
+        `pi-undo: ${large.length} new file(s) over ${MAX_UNTRACKED_SIZE / 1024 / 1024} MB are not snapshotted, so undo cannot remove them: ${listInline(large)}`,
+      )
       const meta = await this.readMeta()
       const next = unique([...(meta.largeExcludes ?? []), ...large]).slice(-MAX_LARGE_EXCLUDES)
       await this.writeMeta({ largeExcludes: next })
@@ -336,19 +349,27 @@ export class ShadowGit implements SnapshotRepo {
   // Stages `paths` for a whole-worktree snapshot. A file can vanish between
   // the listing and the add; that is not worth failing the snapshot for.
   private async stageBestEffort(paths: string[]): Promise<void> {
-    if (paths.length === 0) return
-    const args = ["add", "--all", "--force", "--pathspec-from-file=-", "--pathspec-file-nul"]
-    const batch = await this.git(args, { input: pathspecInput(paths), allowFailure: true })
-    if (batch.code === 0) return
+    const failed = await this.stageBisect(paths)
+    const real: string[] = []
+    for (const file of failed) {
+      if (await this.exists(file)) real.push(file)
+    }
+    if (real.length > 0) this.warn(`pi-undo: could not snapshot ${real.length} file(s): ${listInline(real)}`)
+  }
 
-    const failed: string[] = []
-    for (const file of paths) {
-      const single = await this.git(args, { input: pathspecInput([file]), allowFailure: true })
-      if (single.code !== 0 && (await this.exists(file))) failed.push(file)
-    }
-    if (failed.length > 0) {
-      this.warn(`pi-undo: could not snapshot ${failed.length} file(s): ${listInline(failed)}`)
-    }
+  // Adds `paths` in one command. When that fails, splits the list in halves
+  // to find the paths that fail, instead of one command per path. Returns
+  // the paths that could not be added.
+  private async stageBisect(paths: string[]): Promise<string[]> {
+    if (paths.length === 0) return []
+    const result = await this.git(["add", "--all", "--force", "--pathspec-from-file=-", "--pathspec-file-nul"], {
+      input: pathspecInput(paths),
+      allowFailure: true,
+    })
+    if (result.code === 0) return []
+    if (paths.length === 1) return paths
+    const middle = Math.ceil(paths.length / 2)
+    return [...(await this.stageBisect(paths.slice(0, middle))), ...(await this.stageBisect(paths.slice(middle)))]
   }
 
   private async unstage(paths: string[]): Promise<void> {
@@ -511,9 +532,9 @@ export class ShadowGit implements SnapshotRepo {
   // Borrows the source repository's objects and index, so a fresh store does
   // not copy and re-hash every tracked file.
   private async seed(): Promise<void> {
-    const source = await this.findSourceGitDir()
+    const source = await this.findSource()
     if (!source) return
-    const sourceObjects = path.join(source, "objects")
+    const sourceObjects = path.join(source.commonDir, "objects")
     if (!existsSync(sourceObjects)) return
     const alternates = [sourceObjects]
     try {
@@ -528,10 +549,12 @@ export class ShadowGit implements SnapshotRepo {
     await mkdir(path.join(this.storeDir, "objects", "info"), { recursive: true })
     await writeFile(path.join(this.storeDir, "objects", "info", "alternates"), `${alternates.join("\n")}\n`)
 
-    // A sparse index lists directories instead of files; it is not a valid
-    // starting point for a full snapshot.
-    if (await this.sourceIsSparse()) return
-    const sourceIndex = path.join(source, "index")
+    // The source index lists paths from the repository top. Below the top
+    // they do not match this worktree: every entry would look deleted. A
+    // sparse index lists directories instead of files. Neither is a valid
+    // starting point.
+    if (source.prefix !== "" || (await this.sourceIsSparse())) return
+    const sourceIndex = path.join(source.gitDir, "index")
     if (!existsSync(sourceIndex)) return
     const shadowIndex = path.join(this.storeDir, "index")
     try {
@@ -543,15 +566,18 @@ export class ShadowGit implements SnapshotRepo {
     }
   }
 
-  private findSourceGitDir(): Promise<string | null> {
-    this.sourceGitDir ??= this.runner("git", ["rev-parse", "--absolute-git-dir"], {
-      cwd: this.cwd,
-      timeoutMs: GIT_TIMEOUT_MS,
-    }).then((result) => {
-      const dir = result.code === 0 ? result.stdout.trim() : ""
-      return dir && dir !== this.storeDir ? dir : null
+  private findSource(): Promise<SourceRepo | null> {
+    this.source ??= this.runner(
+      "git",
+      ["rev-parse", "--absolute-git-dir", "--path-format=absolute", "--git-common-dir", "--show-prefix"],
+      { cwd: this.cwd, timeoutMs: GIT_TIMEOUT_MS },
+    ).then((result) => {
+      if (result.code !== 0) return null
+      const [gitDir, commonDir, prefix = ""] = result.stdout.split("\n")
+      if (!gitDir || !commonDir || gitDir === this.storeDir) return null
+      return { gitDir, commonDir, prefix }
     })
-    return this.sourceGitDir
+    return this.source
   }
 
   private async sourceIsSparse(): Promise<boolean> {

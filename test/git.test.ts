@@ -192,6 +192,65 @@ test("track: a seeded store reuses the source repo's objects", () =>
     assert.match(counted, /^count: 0$/m)
   }))
 
+test("track: in a subdirectory of a repository only that subdirectory counts", () =>
+  withDirs(2, async (repo, store) => {
+    const files: Record<string, string> = { "app/main.ts": "x\n" }
+    for (let i = 0; i < 50; i++) files[`other/f${i}.txt`] = "x\n"
+    await makeSourceRepo(repo, files)
+    const warnings: string[] = []
+    const git = await shadow(path.join(repo, "app"), store, { config: { maxFiles: 10 }, warnings })
+    const before = await track(git)
+    assert.deepEqual(warnings, [])
+    assert.deepEqual(await indexedPaths(git), ["main.ts"])
+    await write(repo, "app/main.ts", "y\n")
+    assert.deepEqual(await git.changedFiles(before, await track(git)), ["main.ts"])
+  }))
+
+test("track: a linked git worktree reuses the main repository's objects", () =>
+  withDirs(3, async (repo, store, parent) => {
+    await makeSourceRepo(repo, { "a.txt": "one\n" })
+    const linked = path.join(parent, "linked")
+    await run("git", ["worktree", "add", "--quiet", "-b", "side", linked], repo)
+    const git = await shadow(linked, store)
+    await track(git)
+    const alternates = await read(git.storeDir, "objects/info/alternates")
+    assert.match(alternates, new RegExp(`${path.basename(repo)}/\\.git/objects`))
+    const counted = await run("git", ["--git-dir", git.storeDir, "count-objects", "-v"], linked)
+    assert.match(counted, /^count: 0$/m)
+  }))
+
+test("track: new files over 2 MB are reported once", () =>
+  withDirs(2, async (cwd, store) => {
+    const warnings: string[] = []
+    const git = await shadow(cwd, store, { warnings })
+    await track(git)
+    await write(cwd, "big.bin", Buffer.alloc(2 * 1024 * 1024 + 1, 0x61))
+    await track(git)
+    await track(git)
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0]!, /1 new file\(s\) over 2 MB are not snapshotted.*big\.bin/)
+  }))
+
+test("track: a file that vanishes during staging does not fail the snapshot", () =>
+  withDirs(2, async (cwd, store) => {
+    const { runProcess } = await import("../src/exec.ts")
+    for (let i = 0; i < 8; i++) await write(cwd, `f${i}.txt`, `${i}\n`)
+    let vanished = false
+    const runner: Runner = async (command, args, options) => {
+      if (args.includes("add") && !vanished) {
+        vanished = true
+        await rm(path.join(cwd, "f3.txt"))
+      }
+      return runProcess(command, args, options)
+    }
+    const warnings: string[] = []
+    const git = await shadow(cwd, store, { runner, warnings })
+    await track(git)
+    assert.equal(vanished, true)
+    assert.deepEqual(warnings, [])
+    assert.equal((await indexedPaths(git)).length, 7)
+  }))
+
 test("track: git location variables in the environment are ignored", () =>
   withDirs(3, async (cwd, store, other) => {
     await makeSourceRepo(other)
