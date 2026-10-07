@@ -1,148 +1,138 @@
-import type {
-  ExtensionAPI,
-  SessionEntry,
-} from "@earendil-works/pi-coding-agent";
-import type { Checkpoint, RevertState } from "./types.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
+import type { Checkpoint, FileSnapshot } from "./types.ts"
 
-export const CHECKPOINT_TYPE = "pi-undo/checkpoint";
-export const REVERT_TYPE = "pi-undo/revert";
+export const CHECKPOINT_TYPE = "pi-undo/checkpoint"
+export const REVERT_TYPE = "pi-undo/revert"
 
-/** The subset of session entries that CheckpointStore reads on reload. */
-interface StoreEntry {
+// The fields of a session entry that the store reads.
+export interface StoreEntry {
   type: string
   customType?: string
   data?: unknown
 }
 
+// Checkpoints and the redo stack, persisted as custom session entries so
+// that undo and redo survive a restart.
 export class CheckpointStore {
-  private readonly pi: Pick<ExtensionAPI, "appendEntry">;
-  private readonly checkpoints = new Map<string, Checkpoint>();
-  
-  private reverted: Checkpoint[] = [];
+  private readonly pi: Pick<ExtensionAPI, "appendEntry">
+  private readonly checkpoints = new Map<string, Checkpoint>()
+  // Undone checkpoints, oldest first. The last one is the next redo.
+  private reverted: Checkpoint[] = []
 
   constructor(pi: Pick<ExtensionAPI, "appendEntry">) {
-    this.pi = pi;
+    this.pi = pi
   }
 
-  load(sessionManager: { getEntries(): readonly StoreEntry[] }): void {
-    this.checkpoints.clear();
-    this.reverted = [];
-    let lastRevert: RevertState | undefined;
-    for (const entry of sessionManager.getEntries()) {
-      if (entry.type !== "custom") continue;
+  load(entries: readonly StoreEntry[]): void {
+    this.checkpoints.clear()
+    let revertedIds: string[] = []
+    for (const entry of entries) {
+      if (entry.type !== "custom") continue
       if (entry.customType === CHECKPOINT_TYPE) {
-        const checkpoint = parseCheckpoint(
-          entry.data as Partial<Checkpoint> | undefined,
-        );
-        if (checkpoint)
-          this.checkpoints.set(checkpoint.userEntryId, checkpoint);
+        const checkpoint = parseCheckpoint(entry.data)
+        if (checkpoint) this.checkpoints.set(checkpoint.entryId, checkpoint)
       } else if (entry.customType === REVERT_TYPE) {
-        lastRevert = parseRevert(entry.data);
+        revertedIds = parseRevertedIds(entry.data) ?? revertedIds
       }
     }
-    if (lastRevert) {
-      this.reverted = lastRevert.revertedEntryIds
-        .map((id) => this.checkpoints.get(id))
-        .filter((cp): cp is Checkpoint => Boolean(cp));
-    }
+    this.reverted = revertedIds.flatMap((id) => this.checkpoints.get(id) ?? [])
   }
 
-  get(id: string): Checkpoint | undefined {
-    return this.checkpoints.get(id);
+  get(entryId: string): Checkpoint | undefined {
+    return this.checkpoints.get(entryId)
   }
 
-  
   add(checkpoint: Checkpoint): void {
-    this.checkpoints.set(checkpoint.userEntryId, checkpoint);
-    this.pi.appendEntry(CHECKPOINT_TYPE, checkpoint);
+    this.checkpoints.set(checkpoint.entryId, checkpoint)
+    this.pi.appendEntry(CHECKPOINT_TYPE, { v: 2, ...checkpoint })
   }
 
-  
-  latestOnBranch(branch: SessionEntry[]): Checkpoint | undefined {
+  // The checkpoint of the newest run on the branch.
+  latestOnBranch(branch: readonly { id: string }[]): Checkpoint | undefined {
     for (let i = branch.length - 1; i >= 0; i--) {
-      const entry = branch[i];
-      if (!entry || entry.type !== "message" || entry.message.role !== "user")
-        continue;
-      const checkpoint = this.checkpoints.get(entry.id);
-      if (checkpoint) return checkpoint;
+      const checkpoint = this.checkpoints.get(branch[i]!.id)
+      if (checkpoint) return checkpoint
     }
-    return undefined;
+    return undefined
   }
 
-  
   peekReverted(): Checkpoint | undefined {
-    return this.reverted[this.reverted.length - 1];
+    return this.reverted.at(-1)
   }
 
-  markReverted(checkpoint: Checkpoint): void {
-    this.reverted.push(checkpoint);
-    this.persistRevert();
+  pushReverted(checkpoint: Checkpoint): void {
+    this.reverted.push(checkpoint)
+    this.persistReverted()
   }
 
-  
-  unmarkReverted(): Checkpoint | undefined {
-    const checkpoint = this.reverted.pop();
-    if (checkpoint) this.persistRevert();
-    return checkpoint;
+  popReverted(): Checkpoint | undefined {
+    const checkpoint = this.reverted.pop()
+    if (checkpoint) this.persistReverted()
+    return checkpoint
   }
 
-  
-  clearRevert(): void {
-    if (this.reverted.length === 0) return;
-    this.reverted = [];
-    this.persistRevert();
+  clearReverted(): void {
+    if (this.reverted.length === 0) return
+    this.reverted = []
+    this.persistReverted()
   }
 
-  private persistRevert(): void {
-    this.pi.appendEntry(REVERT_TYPE, {
-      revertedEntryIds: this.reverted.map((cp) => cp.userEntryId),
-    } satisfies RevertState);
+  private persistReverted(): void {
+    this.pi.appendEntry(REVERT_TYPE, { revertedEntryIds: this.reverted.map((cp) => cp.entryId) })
   }
 }
 
-function parseRevert(value: unknown): RevertState | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const ids = (value as { revertedEntryIds?: unknown }).revertedEntryIds;
-  if (!Array.isArray(ids) || !ids.every((id): id is string => typeof id === "string"))
-    return undefined;
-  return { revertedEntryIds: ids };
+type Fields = Record<string, unknown>
+
+function isFields(value: unknown): value is Fields {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-function parseCheckpoint(
-  value: Partial<Checkpoint> | undefined,
-): Checkpoint | null {
-  if (!value || typeof value !== "object") return null;
-  if (typeof value.userEntryId !== "string") return null;
-  if (typeof value.finalLeafId !== "string") return null;
-  if (typeof value.prompt !== "string") return null;
-  if (!Array.isArray(value.files)) return null;
-  const beforeSnapshot =
-    typeof value.beforeSnapshot === "string" ? value.beforeSnapshot : null;
-  const afterSnapshot =
-    typeof value.afterSnapshot === "string" ? value.afterSnapshot : null;
-  if (value.files.length > 0 && (!beforeSnapshot || !afterSnapshot))
-    return null;
-  const createdAt =
-    typeof value.createdAt === "number" ? value.createdAt : Date.now();
-  return {
-    userEntryId: value.userEntryId,
-    beforeLeafId:
-      typeof value.beforeLeafId === "string" ? value.beforeLeafId : null,
+function strings(value: unknown): string[] | undefined {
+  return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : undefined
+}
+
+function parseRevertedIds(value: unknown): string[] | undefined {
+  return isFields(value) ? strings(value.revertedEntryIds) : undefined
+}
+
+// Accepts the current format and the format of pi-undo 0.4 and older, which
+// keyed checkpoints by `userEntryId` and kept the snapshot fields flat.
+export function parseCheckpoint(value: unknown): Checkpoint | null {
+  if (!isFields(value)) return null
+  const entryId = typeof value.entryId === "string" ? value.entryId : value.userEntryId
+  if (typeof entryId !== "string" || typeof value.finalLeafId !== "string" || typeof value.prompt !== "string") {
+    return null
+  }
+  const snapshot = value.v === 2 ? parseSnapshot(value.snapshot) : parseLegacySnapshot(value)
+  if (snapshot === undefined) return null
+  const checkpoint: Checkpoint = {
+    entryId,
     finalLeafId: value.finalLeafId,
     prompt: value.prompt,
     imageCount: typeof value.imageCount === "number" ? value.imageCount : 0,
-    beforeSnapshot,
-    afterSnapshot,
-    files: value.files.filter(
-      (file): file is string => typeof file === "string",
-    ),
-    unattributed: Array.isArray(value.unattributed)
-      ? value.unattributed.filter(
-          (file): file is string => typeof file === "string",
-        )
-      : [],
-    startedAt:
-      typeof value.startedAt === "number" ? value.startedAt : createdAt,
-    createdAt,
-  };
+    snapshot,
+    createdAt: typeof value.createdAt === "number" ? value.createdAt : 0,
+  }
+  if (typeof value.unavailable === "string") checkpoint.unavailable = value.unavailable
+  return checkpoint
+}
+
+// Undefined means the value is malformed; null means "no snapshot".
+function parseSnapshot(value: unknown): FileSnapshot | null | undefined {
+  if (value === null) return null
+  if (!isFields(value)) return undefined
+  const files = strings(value.files)
+  if (typeof value.before !== "string" || typeof value.after !== "string" || !files || files.length === 0) {
+    return undefined
+  }
+  return { before: value.before, after: value.after, files }
+}
+
+function parseLegacySnapshot(value: Fields): FileSnapshot | null | undefined {
+  const files = strings(value.files)
+  if (!files) return undefined
+  if (files.length === 0) return null
+  if (typeof value.beforeSnapshot !== "string" || typeof value.afterSnapshot !== "string") return undefined
+  return { before: value.beforeSnapshot, after: value.afterSnapshot, files }
 }

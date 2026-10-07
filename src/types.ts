@@ -1,50 +1,26 @@
-import type { SessionEntry } from "@earendil-works/pi-coding-agent"
-
-export interface Checkpoint {
-  
-  userEntryId: string
-  
-  beforeLeafId: string | null
-  
-  finalLeafId: string
-  
-  prompt: string
-  
-  imageCount: number
-  
-  beforeSnapshot: string | null
-  
-  afterSnapshot: string | null
-  
+export interface FileSnapshot {
+  // Tree hashes in the shadow repo, taken when the run started and settled.
+  before: string
+  after: string
+  // Paths that differ between the two trees. Never empty.
   files: string[]
-  
-  unattributed: string[]
-  
-  startedAt: number
-  createdAt: number
 }
 
-export interface RevertState {
-  revertedEntryIds: string[]
-}
-
-export interface ActiveTurn {
+// One agent run: the conversation entries it added and the file changes it
+// made.
+export interface Checkpoint {
+  // First entry of the run: the user message, or the custom message that
+  // started it. Undo navigates to it, which moves the session leaf to its
+  // parent.
+  entryId: string
+  // Session leaf when the run settled. Redo navigates back to it.
+  finalLeafId: string
   prompt: string
   imageCount: number
-  
-  userEntryId: string | null
-  beforeLeafId: string | null
-  beforeSnapshot: string | null
-  
-  touched: Map<string, number>
-  
-  startAt: number
-}
-
-export type UserMessageEntry = Extract<SessionEntry, { type: "message" }> & {
-  message: { role: "user" }
-}
-
-export function isUserMessageEntry(entry: SessionEntry): entry is UserMessageEntry {
-  return entry.type === "message" && entry.message.role === "user"
+  // Null when the run changed no files, or when it has no snapshot.
+  snapshot: FileSnapshot | null
+  // Set when the run's files could not be snapshotted, with the reason.
+  // Undo can then roll back the conversation only.
+  unavailable?: string
+  createdAt: number
 }

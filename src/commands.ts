@@ -1,547 +1,281 @@
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent"
-import type { CaptureDeps } from "./capture.ts"
-import type { SnapshotRepo } from "./git.ts"
-import { attributeTouches } from "./journal.ts"
+import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent"
+import type { SkippedPath, SkipReason, SnapshotRepo } from "./git.ts"
+import { applyRestore, planRestore, RestoreError, rollback, type RestorePlan } from "./restore.ts"
 import type { CheckpointStore } from "./store.ts"
+import type { RepoProvider, TrackerContext, TurnTracker } from "./tracker.ts"
 import type { Checkpoint } from "./types.ts"
-import { errorMessage, formatNumstat, listPaths } from "./util.ts"
+import { errorMessage, formatNumstat, listInline, listLines, type NumstatRow } from "./util.ts"
 
-interface RestoreOutcome {
-  ok: boolean
-  skipped: string[]
-  excluded: string[]
-  manualSkipped: string[]
+export interface CommandContext extends TrackerContext {
+  hasUI: boolean
+  ui: Pick<ExtensionUIContext, "notify" | "confirm" | "getEditorText" | "setEditorText">
+  abort(): void
+  waitForIdle(): Promise<void>
+  navigateTree(targetId: string, options?: { summarize?: boolean }): Promise<{ cancelled: boolean }>
 }
 
-interface AttributionGroups {
-  editedFiles: string[]
-  unknownFiles: string[]
-  otherSession: string[]
-  otherSessionFiles: string[]
+export interface CommandDeps {
+  store: CheckpointStore
+  tracker: TurnTracker
+  repoFor: RepoProvider
+  // True while a command navigates the session tree, so the tree listener
+  // can tell these navigations from the user's own.
+  navigation: { active: boolean }
 }
 
-// Returns the message files that would be clobbered by a restore to `target`.
-// A file that currently equals the target snapshot cannot be clobbered by the
-// restore, so it is never a manual edit for this operation. This keeps a
-// declined file (left at the after state by an undo, or at the before state by
-// a redo) from triggering a spurious manual-edits prompt on the opposite
-// operation.
-async function manualEdits(
-  git: SnapshotRepo,
-  since: string,
-  target: string,
-  messageFiles: ReadonlySet<string>,
-): Promise<string[]> {
-  const dirty = await git.dirtySinceAll(since)
-  const candidates = [...dirty.manual, ...dirty.ignored].filter((file) => messageFiles.has(file))
-  if (candidates.length === 0) return []
-  const targetDirty = await git.dirtySinceAll(target)
-  const targetSet = new Set([...targetDirty.manual, ...targetDirty.ignored])
-  return candidates.filter((file) => targetSet.has(file))
+type Direction = "undo" | "redo"
+
+const WORDS = {
+  undo: { name: "Undo", past: "Undid", state: "before" },
+  redo: { name: "Redo", past: "Redid", state: "after" },
+} as const
+
+const SKIP_REASONS: Record<SkipReason, string> = {
+  symlink: "below a symlinked directory",
+  excluded: "excluded by pi-undo.json",
 }
 
-async function restoreFiles(
-  git: SnapshotRepo,
-  target: string,
-  files: string[],
-  since?: string,
-  opts?: { manualSet?: ReadonlySet<string>; force?: boolean; verifyExclude?: string[] },
-): Promise<RestoreOutcome> {
-  const { skipped, excluded, manualSkipped } = await git.restoreSnapshot(target, files, since, opts)
-  const ok = await git.verifySnapshot(target, [
-    ...skipped,
-    ...excluded,
-    ...manualSkipped,
-    ...(opts?.verifyExclude ?? []),
-  ])
-  return { ok, skipped, excluded, manualSkipped }
-}
-
-async function rollbackFiles(
-  git: SnapshotRepo,
-  snapshot: string,
-  files: string[],
-  outcome: { skipped: string[]; excluded: string[]; manualSkipped: string[] },
-): Promise<boolean> {
-  try {
-    // Rollback must skip exactly the files the failed restore skipped: those
-    // files were never changed by it. Recomputing the manual-edit list now
-    // would see the failed restore's own changes and skip files it just
-    // restored. Pass the original manualSkipped list through as manualSet.
-    return (await restoreFiles(git, snapshot, files, undefined, { manualSet: new Set(outcome.manualSkipped) })).ok
-  } catch {
-    return false
-  }
-}
-
-function formatList(paths: string[], max = 10): string {
-  const shown = paths.slice(0, max).join("\n")
-  return shown + (paths.length > max ? `\n... and ${paths.length - max} more` : "")
-}
-
-// Splits the checkpoint files into the three groups the dialogs need:
-// editedFiles (this session's write/edit tools touched them), otherSession
-// (another pi session's journal names them), and unknownFiles (changed, but
-// no known source). The journal is best effort: any failure means every
-// unattributed file is treated as unknown.
-async function splitFiles(
-  git: SnapshotRepo,
-  checkpoint: Checkpoint,
-  selfSessionId: string,
-): Promise<AttributionGroups> {
-  const unattributed = checkpoint.unattributed ?? []
-  const unattributedSet = new Set(unattributed)
-  const editedFiles = checkpoint.files.filter((file) => !unattributedSet.has(file))
-  // Only touches made during this message count. A stale touch from an old
-  // message must not permanently attribute a path to another session. Old
-  // checkpoints without startedAt fall back to a zero-width window around
-  // createdAt, so every unattributed file degrades safely to "unknown".
-  const window = {
-    from: checkpoint.startedAt ?? checkpoint.createdAt,
-    to: checkpoint.createdAt,
-  }
-  let attributed = new Map<string, string[]>()
-  if (unattributed.length > 0) {
-    try {
-      attributed = await attributeTouches(git.storeDir, selfSessionId, unattributed, window)
-    } catch {
-      attributed = new Map()
-    }
-  }
-  const otherSessionFiles = unattributed.filter((file) => attributed.has(file))
-  const otherSession = otherSessionFiles.map((file) => {
-    const sessions = attributed.get(file) ?? []
-    return `${file} (session ${sessions.join(", ")})`
-  })
-  const unknownFiles = unattributed.filter((file) => !attributed.has(file))
-  return { editedFiles, unknownFiles, otherSession, otherSessionFiles }
-}
-
-export function registerCommands(
-  pi: Pick<ExtensionAPI, "registerCommand">,
-  store: CheckpointStore,
-  deps: CaptureDeps,
-): void {
+export function registerCommands(pi: Pick<ExtensionAPI, "registerCommand">, deps: CommandDeps): void {
   pi.registerCommand("undo", {
-    description: "Undo the last user message and restore file state",
-    handler: async (_args, ctx) => {
-      await undo(store, deps, ctx)
-    },
+    description: "Undo the last message: roll back the conversation and the files it changed",
+    handler: (_args, ctx) => undo(deps, ctx),
   })
-
   pi.registerCommand("redo", {
-    description: "Redo the most recently undone message",
-    handler: async (_args, ctx) => {
-      await redo(store, deps, ctx)
-    },
+    description: "Redo the last undone message",
+    handler: (_args, ctx) => redo(deps, ctx),
   })
-
   pi.registerCommand("diff", {
-    description: "Preview the file changes that /undo would restore",
-    handler: async (_args, ctx) => {
-      await diff(store, deps, ctx)
-    },
+    description: "Show the file changes that /undo would roll back",
+    handler: (_args, ctx) => diff(deps, ctx),
   })
 }
 
-async function ensureIdle(ctx: ExtensionCommandContext): Promise<void> {
-  if (ctx.isIdle()) return
-  ctx.abort()
-  await ctx.waitForIdle()
-}
-
-interface SnapshotChanges {
-  before: string
-  after: string
-}
-
-function snapshotChanges(checkpoint: Checkpoint): SnapshotChanges | null {
-  if (checkpoint.files.length === 0) return null
-  if (!checkpoint.beforeSnapshot || !checkpoint.afterSnapshot) return null
-  return { before: checkpoint.beforeSnapshot, after: checkpoint.afterSnapshot }
-}
-
-async function undo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCommandContext): Promise<void> {
-  await ensureIdle(ctx)
-
-  const checkpoint = store.latestOnBranch(ctx.sessionManager.getBranch())
+export async function undo(deps: CommandDeps, ctx: CommandContext): Promise<void> {
+  await settle(deps, ctx)
+  const checkpoint = deps.store.latestOnBranch(ctx.sessionManager.getBranch())
   if (!checkpoint) {
     ctx.ui.notify("Nothing to undo", "info")
     return
   }
-  if (!checkpoint.beforeLeafId) {
-    ctx.ui.notify("Cannot undo the first message in place; fork before it instead", "warning")
-    return
-  }
-
-  const changes = snapshotChanges(checkpoint)
-  let skipped: string[] = []
-  let excluded: string[] = []
-  let manualSkipped: string[] = []
-  let filesToRestore: string[] = []
-  let unknownLeft: string[] = []
-  let otherSession: string[] = []
-  let outcome: RestoreOutcome | null = null
-  let didRestore = false
-  try {
-    if (changes) {
-      const git = deps.getGit(ctx)
-      // Only files the message changed can be clobbered by the restore.
-      // Manual edits in other files survive the undo, so they must not
-      // block it or trigger the dialog. Gitignored files are included too:
-      // the dialog now covers them instead of skipping them silently.
-      const manualInMessage = await manualEdits(git, changes.after, changes.before, new Set(checkpoint.files))
-      if (manualInMessage.length > 0) {
-        const list = formatList(manualInMessage)
-        const force = await ctx.ui.confirm(
-          "Manual edits found",
-          `These files were changed by the last message and have manual edits since:\n${list}\n\nRestore anyway and lose these edits?`,
-        )
-        if (!force) {
-          ctx.ui.notify("Undo blocked: working tree has manual edits in files changed by the message", "warning")
-          return
-        }
-      }
-
-      const groups = await splitFiles(git, checkpoint, ctx.sessionManager.getSessionId())
-      otherSession = groups.otherSession
-      const editedSet = new Set(groups.editedFiles)
-
-      const stats = await git.diffNumstat(changes.before, changes.after)
-      const preview = formatNumstat(
-        stats.rows.filter((row) => editedSet.has(row.file)),
-        20,
-        stats.binaryCount,
-      )
-      let message =
-        groups.editedFiles.length === 0
-          ? `This session did not edit any of the changed files with its file tools.\n\nRestore files to the state before this message?`
-          : `${preview}\n\nRestore files to the state before this message?`
-      if (groups.unknownFiles.length > 0) {
-        message += `\n\nChanged during the message by other sources, not restored:\n${formatList(groups.unknownFiles)}`
-      }
-      if (otherSession.length > 0) {
-        message += `\n\nEdited by other pi sessions, not restored:\n${formatList(otherSession)}`
-      }
-      const ok = await ctx.ui.confirm("Undo message", message)
-      if (!ok) {
-        ctx.ui.notify("Undo cancelled", "info")
-        return
-      }
-
-      // Files this session did not touch are never restored. The dialog
-      // above warns about them; they are left alone.
-      filesToRestore = groups.editedFiles
-      unknownLeft = groups.unknownFiles
-
-      // Files deliberately left alone (unattributed and other-session files)
-      // still sit in the shadow index at their after state. Verification
-      // compares the index to the target snapshot, so exclude them from the
-      // check or a correct restore fails verification and rolls back.
-      const leftOut = [...unknownLeft, ...groups.otherSessionFiles]
-
-      if (filesToRestore.length > 0) {
-        outcome = await restoreFiles(git, changes.before, filesToRestore, changes.after, {
-          force: manualInMessage.length > 0,
-          verifyExclude: leftOut,
-        })
-        if (!outcome.ok) {
-          const rolledBack = await rollbackFiles(git, changes.after, filesToRestore, outcome)
-          ctx.ui.notify(
-            rolledBack
-              ? "Undo failed: restored files do not match the snapshot; state rolled back"
-              : "Undo failed: restored files do not match the snapshot, and the rollback also failed; the working tree can be inconsistent",
-            "error",
-          )
-          return
-        }
-        didRestore = true
-        skipped = outcome.skipped
-        excluded = outcome.excluded
-        manualSkipped = outcome.manualSkipped
-      }
-    }
-
-    
-    let result: { cancelled: boolean }
-    try {
-      result = await ctx.navigateTree(checkpoint.beforeLeafId, { summarize: false })
-    } catch (error) {
-      if (didRestore && outcome && changes) {
-        const rolledBack = await rollbackFiles(deps.getGit(ctx), changes.after, filesToRestore, outcome)
-        if (!rolledBack) {
-          ctx.ui.notify(
-            `Undo failed: ${errorMessage(error)}; the file rollback also failed, the working tree can be inconsistent`,
-            "error",
-          )
-          return
-        }
-      }
-      ctx.ui.notify(`Undo failed: ${errorMessage(error)}`, "error")
-      return
-    }
-    if (result.cancelled) {
-      
-      if (didRestore && outcome && changes) {
-        const rolledBack = await rollbackFiles(deps.getGit(ctx), changes.after, filesToRestore, outcome)
-        if (!rolledBack) {
-          ctx.ui.notify("Undo cancelled; the file rollback also failed, the working tree can be inconsistent", "warning")
-          return
-        }
-      }
-      ctx.ui.notify("Undo cancelled", "info")
-      return
-    }
-
-    store.markReverted(checkpoint)
-    
-    ctx.ui.setEditorText(checkpoint.prompt)
-    const restoredCount = filesToRestore.length - skipped.length - excluded.length - manualSkipped.length
-    const filesNote = restoredCount > 0 ? `, restored ${restoredCount} file(s)` : ""
-    ctx.ui.notify(`Undid message${filesNote}`, "info")
-    if (skipped.length > 0) {
-      ctx.ui.notify(
-        `Note: ${skipped.length} file(s) not restored, a parent directory is a symlink: ${listPaths(skipped)}`,
-        "warning",
-      )
-    }
-    if (excluded.length > 0) {
-      ctx.ui.notify(
-        `Note: ${excluded.length} file(s) not restored, excluded by pi-undo.json: ${listPaths(excluded)}`,
-        "warning",
-      )
-    }
-    if (manualSkipped.length > 0) {
-      ctx.ui.notify(
-        `Note: ${manualSkipped.length} file(s) not restored, manual edits in gitignored files: ${listPaths(manualSkipped)}`,
-        "warning",
-      )
-    }
-    if (unknownLeft.length > 0) {
-      ctx.ui.notify(
-        `Note: ${unknownLeft.length} file(s) changed during the message but were not edited by this session; left alone: ${listPaths(unknownLeft)}`,
-        "warning",
-      )
-    }
-    if (otherSession.length > 0) {
-      ctx.ui.notify(
-        `Note: ${otherSession.length} file(s) edited by other pi sessions, never restored: ${listPaths(otherSession)}`,
-        "warning",
-      )
-    }
-    if (checkpoint.imageCount > 0) {
-      ctx.ui.notify(`Note: ${checkpoint.imageCount} image attachment(s) from the prompt were not restored`, "warning")
-    }
-  } catch (error) {
-    ctx.ui.notify(`Undo failed: ${errorMessage(error)}`, "error")
-  }
+  await revert(deps, ctx, checkpoint, "undo")
 }
 
-async function redo(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCommandContext): Promise<void> {
-  await ensureIdle(ctx)
-
-  const checkpoint = store.peekReverted()
+export async function redo(deps: CommandDeps, ctx: CommandContext): Promise<void> {
+  await settle(deps, ctx)
+  const checkpoint = deps.store.peekReverted()
   if (!checkpoint) {
     ctx.ui.notify("Nothing to redo", "info")
     return
   }
-
-  const changes = snapshotChanges(checkpoint)
-  let skipped: string[] = []
-  let excluded: string[] = []
-  let manualSkipped: string[] = []
-  let filesToRestore: string[] = []
-  let unknownLeft: string[] = []
-  let otherSession: string[] = []
-  let outcome: RestoreOutcome | null = null
-  let didRestore = false
-  try {
-    if (changes) {
-      const git = deps.getGit(ctx)
-      const manualInMessage = await manualEdits(git, changes.before, changes.after, new Set(checkpoint.files))
-      if (manualInMessage.length > 0) {
-        const list = formatList(manualInMessage)
-        const force = await ctx.ui.confirm(
-          "Manual edits found",
-          `These files were changed by the last message and have manual edits since:\n${list}\n\nRestore anyway and lose these edits?`,
-        )
-        if (!force) {
-          ctx.ui.notify("Redo blocked: working tree has manual edits in files changed by the message", "warning")
-          return
-        }
-      }
-
-      const groups = await splitFiles(git, checkpoint, ctx.sessionManager.getSessionId())
-      otherSession = groups.otherSession
-      const editedSet = new Set(groups.editedFiles)
-
-      const stats = await git.diffNumstat(changes.before, changes.after)
-      const preview = formatNumstat(
-        stats.rows.filter((row) => editedSet.has(row.file)),
-        20,
-        stats.binaryCount,
-      )
-      let message =
-        groups.editedFiles.length === 0
-          ? `This session did not edit any of the changed files with its file tools.\n\nRestore files to the state after this message?`
-          : `${preview}\n\nRestore files to the state after this message?`
-      if (groups.unknownFiles.length > 0) {
-        message += `\n\nChanged during the message by other sources, not restored:\n${formatList(groups.unknownFiles)}`
-      }
-      if (otherSession.length > 0) {
-        message += `\n\nEdited by other pi sessions, not restored:\n${formatList(otherSession)}`
-      }
-      const ok = await ctx.ui.confirm("Redo message", message)
-      if (!ok) {
-        ctx.ui.notify("Redo cancelled", "info")
-        return
-      }
-
-      // Files this session did not touch are never restored. The dialog
-      // above warns about them; they are left alone.
-      filesToRestore = groups.editedFiles
-      unknownLeft = groups.unknownFiles
-
-      // Files deliberately left alone (unattributed and other-session files)
-      // still sit in the shadow index at their after state. Verification
-      // compares the index to the target snapshot, so exclude them from the
-      // check or a correct restore fails verification and rolls back.
-      const leftOut = [...unknownLeft, ...groups.otherSessionFiles]
-
-      if (filesToRestore.length > 0) {
-        outcome = await restoreFiles(git, changes.after, filesToRestore, changes.before, {
-          force: manualInMessage.length > 0,
-          verifyExclude: leftOut,
-        })
-        if (!outcome.ok) {
-          const rolledBack = await rollbackFiles(git, changes.before, filesToRestore, outcome)
-          ctx.ui.notify(
-            rolledBack
-              ? "Redo failed: restored files do not match the snapshot; state rolled back"
-              : "Redo failed: restored files do not match the snapshot, and the rollback also failed; the working tree can be inconsistent",
-            "error",
-          )
-          return
-        }
-        didRestore = true
-        skipped = outcome.skipped
-        excluded = outcome.excluded
-        manualSkipped = outcome.manualSkipped
-      }
-    }
-
-    
-    let result: { cancelled: boolean }
-    try {
-      result = await ctx.navigateTree(checkpoint.finalLeafId, { summarize: false })
-    } catch (error) {
-      if (didRestore && outcome && changes) {
-        const rolledBack = await rollbackFiles(deps.getGit(ctx), changes.before, filesToRestore, outcome)
-        if (!rolledBack) {
-          ctx.ui.notify(
-            `Redo failed: ${errorMessage(error)}; the file rollback also failed, the working tree can be inconsistent`,
-            "error",
-          )
-          return
-        }
-      }
-      ctx.ui.notify(`Redo failed: ${errorMessage(error)}`, "error")
-      return
-    }
-    if (result.cancelled) {
-      if (didRestore && outcome && changes) {
-        const rolledBack = await rollbackFiles(deps.getGit(ctx), changes.before, filesToRestore, outcome)
-        if (!rolledBack) {
-          ctx.ui.notify("Redo cancelled; the file rollback also failed, the working tree can be inconsistent", "warning")
-          return
-        }
-      }
-      ctx.ui.notify("Redo cancelled", "info")
-      return
-    }
-
-    store.unmarkReverted()
-    ctx.ui.setEditorText("")
-    const restoredCount = filesToRestore.length - skipped.length - excluded.length - manualSkipped.length
-    const filesNote = restoredCount > 0 ? `, restored ${restoredCount} file(s)` : ""
-    ctx.ui.notify(`Redid message${filesNote}`, "info")
-    if (skipped.length > 0) {
-      ctx.ui.notify(
-        `Note: ${skipped.length} file(s) not restored, a parent directory is a symlink: ${listPaths(skipped)}`,
-        "warning",
-      )
-    }
-    if (excluded.length > 0) {
-      ctx.ui.notify(
-        `Note: ${excluded.length} file(s) not restored, excluded by pi-undo.json: ${listPaths(excluded)}`,
-        "warning",
-      )
-    }
-    if (manualSkipped.length > 0) {
-      ctx.ui.notify(
-        `Note: ${manualSkipped.length} file(s) not restored, manual edits in gitignored files: ${listPaths(manualSkipped)}`,
-        "warning",
-      )
-    }
-    if (unknownLeft.length > 0) {
-      ctx.ui.notify(
-        `Note: ${unknownLeft.length} file(s) changed during the message but were not edited by this session; left alone: ${listPaths(unknownLeft)}`,
-        "warning",
-      )
-    }
-    if (otherSession.length > 0) {
-      ctx.ui.notify(
-        `Note: ${otherSession.length} file(s) edited by other pi sessions, never restored: ${listPaths(otherSession)}`,
-        "warning",
-      )
-    }
-  } catch (error) {
-    ctx.ui.notify(`Redo failed: ${errorMessage(error)}`, "error")
-  }
+  await revert(deps, ctx, checkpoint, "redo")
 }
 
-async function diff(store: CheckpointStore, deps: CaptureDeps, ctx: ExtensionCommandContext): Promise<void> {
-  await ensureIdle(ctx)
-
-  const checkpoint: Checkpoint | undefined = store.latestOnBranch(ctx.sessionManager.getBranch())
+export async function diff(deps: CommandDeps, ctx: CommandContext): Promise<void> {
+  // A preview must not stop a running agent. It shows the last finished
+  // message instead.
+  const running = !ctx.isIdle()
+  if (!running) await deps.tracker.flush(ctx)
+  const checkpoint = deps.store.latestOnBranch(ctx.sessionManager.getBranch())
+  const header = running ? "The agent is running; this is the last finished message.\n\n" : ""
   if (!checkpoint) {
-    ctx.ui.notify("Nothing to preview: no checkpointed messages", "info")
+    ctx.ui.notify(`${header}Nothing to preview: no message has a checkpoint yet`, "info")
     return
   }
-  const changes = snapshotChanges(checkpoint)
-  if (!changes) {
-    ctx.ui.notify("The last message changed no files", "info")
+  if (!checkpoint.snapshot) {
+    const text = checkpoint.unavailable
+      ? `The last message has no file snapshot: ${checkpoint.unavailable}`
+      : "The last message changed no files"
+    ctx.ui.notify(header + text, "info")
     return
   }
   try {
-    const git = deps.getGit(ctx)
-    const stats = await git.diffNumstat(changes.before, changes.after)
-    const unattributed = checkpoint.unattributed ?? []
-    const unattributedSet = new Set(unattributed)
-    let message = `Changes made by the last message (what /undo restores):\n\n${formatNumstat(
-      stats.rows.filter((row) => !unattributedSet.has(row.file)),
-      20,
-      stats.binaryCount,
-    )}`
-    if (unattributed.length > 0) {
-      let attributed = new Map<string, string[]>()
-      try {
-        const window = {
-          from: checkpoint.startedAt ?? checkpoint.createdAt,
-          to: checkpoint.createdAt,
-        }
-        attributed = await attributeTouches(git.storeDir, ctx.sessionManager.getSessionId(), unattributed, window)
-      } catch {
-        attributed = new Map()
-      }
-      const lines = unattributed.map((file) => {
-        const sessions = attributed.get(file)
-        return sessions && sessions.length > 0 ? `${file} (session ${sessions.join(", ")})` : file
-      })
-      message += `\n\nChanged during the message by other sources (not restored by /undo):\n${lines.join("\n")}`
+    const repo = deps.repoFor(ctx)
+    const { before, after, files } = checkpoint.snapshot
+    if (!(await repo.hasTrees([before, after]))) {
+      ctx.ui.notify(`${header}The file snapshots of the last message are gone; /undo can roll back the conversation only`, "info")
+      return
     }
-    ctx.ui.notify(message, "info")
+    const rows = await repo.diffNumstat(before, after)
+    let text = `${header}Changes made by the last message (what /undo rolls back):\n\n${formatNumstat(rows)}`
+    if (!running) {
+      const plan = await planRestore(repo, files, after, before)
+      text += planDetails(plan)
+    }
+    ctx.ui.notify(text, "info")
   } catch (error) {
     ctx.ui.notify(`Preview failed: ${errorMessage(error)}`, "error")
   }
+}
+
+// Stops a running agent and makes sure its run has a checkpoint.
+async function settle(deps: CommandDeps, ctx: CommandContext): Promise<void> {
+  if (!ctx.isIdle()) {
+    ctx.abort()
+    await ctx.waitForIdle()
+  }
+  await deps.tracker.flush(ctx)
+}
+
+interface Restored {
+  repo: SnapshotRepo
+  plan: RestorePlan
+}
+
+// Moves files and conversation together to the state before (undo) or after
+// (redo) the checkpoint's message. Files first: if the files cannot be
+// restored, the conversation stays where it is. If the conversation cannot
+// move, the files are rolled back.
+async function revert(deps: CommandDeps, ctx: CommandContext, checkpoint: Checkpoint, direction: Direction): Promise<void> {
+  const words = WORDS[direction]
+  const notes: string[] = []
+  let restored: Restored | undefined
+  try {
+    const outcome = await restoreFiles(deps, ctx, checkpoint, direction, notes)
+    if (outcome === "cancelled") {
+      ctx.ui.notify(`${words.name} cancelled`, "info")
+      return
+    }
+    restored = outcome
+  } catch (error) {
+    ctx.ui.notify(failureText(words.name, error), "error")
+    return
+  }
+
+  const navigationError = await navigate(deps, ctx, direction === "undo" ? checkpoint.entryId : checkpoint.finalLeafId)
+  if (navigationError !== undefined) {
+    const rolledBack = restored ? await rollback(restored.repo, restored.plan) : true
+    const reason = navigationError === "cancelled" ? `${words.name} cancelled` : `${words.name} failed: ${navigationError}`
+    ctx.ui.notify(
+      rolledBack
+        ? reason
+        : `${reason}. The files could not be put back either; check: ${listInline(restored?.plan.paths ?? [])}`,
+      rolledBack && navigationError === "cancelled" ? "info" : "error",
+    )
+    return
+  }
+
+  if (direction === "undo") {
+    deps.store.pushReverted(checkpoint)
+    // pi fills an empty editor with the undone prompt on its own. This only
+    // covers modes where it does not, and never replaces a draft.
+    if (!ctx.ui.getEditorText().trim()) ctx.ui.setEditorText(checkpoint.prompt)
+    if (checkpoint.imageCount > 0) {
+      notes.push(`${checkpoint.imageCount} image attachment(s) of the prompt are not back in the editor.`)
+    }
+  } else {
+    deps.store.popReverted()
+    if (ctx.ui.getEditorText().trim() === checkpoint.prompt.trim()) ctx.ui.setEditorText("")
+  }
+
+  const count = restored?.plan.paths.length ?? 0
+  ctx.ui.notify(`${words.past} message${count > 0 ? `, restored ${count} file(s)` : ""}`, "info")
+  if (notes.length > 0) ctx.ui.notify(notes.join("\n"), "warning")
+}
+
+// Restores the checkpoint's files, after the user confirms. Returns the
+// applied plan (undefined when no file had to change) or "cancelled".
+async function restoreFiles(
+  deps: CommandDeps,
+  ctx: CommandContext,
+  checkpoint: Checkpoint,
+  direction: Direction,
+  notes: string[],
+): Promise<Restored | undefined | "cancelled"> {
+  const words = WORDS[direction]
+  if (!checkpoint.snapshot) {
+    if (!checkpoint.unavailable) return undefined
+    const ok = await confirmConversationOnly(ctx, words.name, `This message has no file snapshot: ${checkpoint.unavailable}.`)
+    if (!ok) return "cancelled"
+    notes.push("Files were not restored: the message has no file snapshot.")
+    return undefined
+  }
+
+  const repo = deps.repoFor(ctx)
+  const { before, after, files } = checkpoint.snapshot
+  if (!(await repo.hasTrees([before, after]))) {
+    const ok = await confirmConversationOnly(
+      ctx,
+      words.name,
+      "The file snapshots of this message are gone: they were pruned, or the session moved to another directory.",
+    )
+    if (!ok) return "cancelled"
+    notes.push("Files were not restored: the snapshots are gone.")
+    return undefined
+  }
+
+  const [current, target] = direction === "undo" ? [after, before] : [before, after]
+  const plan = await planRestore(repo, files, current, target)
+  const rows = await repo.diffNumstat(before, after)
+  if (ctx.hasUI) {
+    if (!(await ctx.ui.confirm(`${words.name} message`, restoreDialog(direction, plan, rows)))) return "cancelled"
+  } else if (plan.manualEdits.length > 0) {
+    // Without a UI nobody can confirm that manual edits may be lost.
+    throw new Error(`files were changed after the message: ${listInline(plan.manualEdits)}`)
+  }
+
+  await applyRestore(repo, plan)
+  notes.push(...skippedNotes(plan.skipped))
+  return { repo, plan }
+}
+
+async function confirmConversationOnly(ctx: CommandContext, name: string, reason: string): Promise<boolean> {
+  if (!ctx.hasUI) return true
+  return ctx.ui.confirm(`${name} message`, `${reason}\n\n${name} the conversation only and leave the files as they are?`)
+}
+
+async function navigate(deps: CommandDeps, ctx: CommandContext, targetId: string): Promise<string | undefined> {
+  deps.navigation.active = true
+  try {
+    const result = await ctx.navigateTree(targetId, { summarize: false })
+    return result.cancelled ? "cancelled" : undefined
+  } catch (error) {
+    return errorMessage(error)
+  } finally {
+    deps.navigation.active = false
+  }
+}
+
+function restoreDialog(direction: Direction, plan: RestorePlan, rows: readonly NumstatRow[]): string {
+  const { state } = WORDS[direction]
+  const intro =
+    plan.paths.length > 0
+      ? `Restore ${plan.paths.length} file(s) to their state ${state} this message?`
+      : `The files already match their state ${state} this message. Move the conversation only?`
+  return `${intro}\n\nChanges made by the message:\n${formatNumstat(rows)}${planDetails(plan)}`
+}
+
+function planDetails(plan: RestorePlan): string {
+  let text = ""
+  if (plan.manualEdits.length > 0) {
+    text += `\n\nChanged after the message. These changes will be lost:\n${listLines(plan.manualEdits)}`
+  }
+  for (const [reason, paths] of groupSkipped(plan.skipped)) {
+    text += `\n\nNot restored, ${SKIP_REASONS[reason]}:\n${listLines(paths)}`
+  }
+  return text
+}
+
+function skippedNotes(skipped: readonly SkippedPath[]): string[] {
+  return [...groupSkipped(skipped)].map(
+    ([reason, paths]) => `${paths.length} file(s) not restored, ${SKIP_REASONS[reason]}: ${listInline(paths)}`,
+  )
+}
+
+function groupSkipped(skipped: readonly SkippedPath[]): Map<SkipReason, string[]> {
+  const groups = new Map<SkipReason, string[]>()
+  for (const { path, reason } of skipped) {
+    const paths = groups.get(reason)
+    if (paths) paths.push(path)
+    else groups.set(reason, [path])
+  }
+  return groups
+}
+
+function failureText(name: string, error: unknown): string {
+  if (error instanceof RestoreError) {
+    return error.rolledBack
+      ? `${name} failed, the files are unchanged: ${error.message}`
+      : `${name} failed, and putting the files back failed too (${error.message}). Check: ${listInline(error.paths)}`
+  }
+  return `${name} failed: ${errorMessage(error)}`
 }

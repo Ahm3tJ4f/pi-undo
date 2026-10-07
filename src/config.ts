@@ -5,9 +5,13 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent"
 export interface PiUndoConfig {
   excludeDirectories: string[]
   maxFiles: number
+  // Snapshots older than this many days are pruned by the daily gc. Undo of
+  // an older message can still roll back the conversation, but not files.
+  retentionDays: number
 }
 
 export const DEFAULT_MAX_FILES = 100_000
+export const DEFAULT_RETENTION_DAYS = 30
 
 // Matched at any depth in every project. These are regenerated or app-owned,
 // never worth snapshotting: dependencies, build output, tool caches. Entries
@@ -71,6 +75,7 @@ export const DEFAULT_EXCLUDE_DIRECTORIES: string[] = [
 export const DEFAULT_CONFIG: PiUndoConfig = {
   excludeDirectories: DEFAULT_EXCLUDE_DIRECTORIES,
   maxFiles: DEFAULT_MAX_FILES,
+  retentionDays: DEFAULT_RETENTION_DAYS,
 }
 
 /**
@@ -88,10 +93,7 @@ export function loadPiUndoConfig(globalPath?: string): PiUndoConfig {
   const file = globalPath ?? path.join(getAgentDir(), "pi-undo.json")
   if (!existsSync(file)) writeDefaults(file)
   const config = readConfigFile(file)
-  return {
-    excludeDirectories: config.excludeDirectories ?? DEFAULT_EXCLUDE_DIRECTORIES,
-    maxFiles: config.maxFiles ?? DEFAULT_MAX_FILES,
-  }
+  return { ...DEFAULT_CONFIG, ...config }
 }
 
 function writeDefaults(file: string): void {
@@ -107,20 +109,22 @@ function writeDefaults(file: string): void {
 function readConfigFile(file: string): Partial<PiUndoConfig> {
   try {
     const raw = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>
-    const excludeDirectories = Array.isArray(raw.excludeDirectories)
-      ? raw.excludeDirectories.filter(
-          (value): value is string => typeof value === "string" && value.length > 0,
-        )
-      : undefined
-    const maxFiles =
-      typeof raw.maxFiles === "number" && Number.isFinite(raw.maxFiles) && raw.maxFiles > 0
-        ? raw.maxFiles
-        : undefined
-    return {
-      ...(excludeDirectories !== undefined ? { excludeDirectories } : {}),
-      ...(maxFiles !== undefined ? { maxFiles } : {}),
+    const config: Partial<PiUndoConfig> = {}
+    if (Array.isArray(raw.excludeDirectories)) {
+      config.excludeDirectories = raw.excludeDirectories.filter(
+        (value): value is string => typeof value === "string" && value.trim().length > 0,
+      )
     }
+    const maxFiles = positiveNumber(raw.maxFiles)
+    if (maxFiles !== undefined) config.maxFiles = Math.floor(maxFiles)
+    const retentionDays = positiveNumber(raw.retentionDays)
+    if (retentionDays !== undefined) config.retentionDays = retentionDays
+    return config
   } catch {
     return {}
   }
+}
+
+function positiveNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined
 }

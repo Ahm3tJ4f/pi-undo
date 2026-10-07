@@ -1,1179 +1,443 @@
-import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import { test } from "node:test";
-
-import { ShadowGit, snapshotStoreRoot } from "../src/git.ts";
-import { loadPiUndoConfig } from "../src/config.ts";
-
-process.env.PI_UNDO_STORE_ROOT = path.join(tmpdir(), `pi-undo-test-store-${process.pid}`);
-
-type Exec = (
-  command: string,
-  args: string[],
-  options?: { cwd?: string; timeout?: number },
-) => Promise<{
-  stdout: string;
-  stderr: string;
-  code: number;
-  killed: boolean;
-}>;
-
-function fakePi(): { exec: Exec } {
-  return {
-    exec: (command, args, options) =>
-      new Promise((resolve) => {
-        execFile(
-          command,
-          args,
-          { cwd: options?.cwd, timeout: options?.timeout },
-          (error, stdout, stderr) => {
-            const raw = error as { code?: number | string } | null;
-            const code =
-              typeof raw?.code === "number" ? raw.code : error ? 1 : 0;
-            resolve({
-              stdout: String(stdout),
-              stderr: String(stderr),
-              code,
-              killed: false,
-            });
-          },
-        );
-      }),
-  };
-}
-
-const exec = fakePi().exec;
-
-async function newTempDir(prefix: string): Promise<string> {
-  return mkdtemp(path.join(tmpdir(), prefix));
-}
-
-async function newShadow(cwd: string): Promise<ShadowGit> {
-  const git = new ShadowGit(fakePi(), cwd);
-  await git.ensure();
-  return git;
-}
-
-async function tracked(git: ShadowGit): Promise<string> {
-  const snapshot = await git.track();
-  assert.ok(snapshot, "track() returned undefined");
-  return snapshot;
-}
-
-async function makeSourceRepo(
-  cwd: string,
-  files: Record<string, string>,
-): Promise<void> {
-  for (const [rel, content] of Object.entries(files)) {
-    await mkdir(path.dirname(path.join(cwd, rel)), { recursive: true });
-    await writeFile(path.join(cwd, rel), content);
-  }
-  await exec("git", ["init", "--quiet"], { cwd });
-  await exec("git", ["config", "user.email", "t@example.com"], { cwd });
-  await exec("git", ["config", "user.name", "test"], { cwd });
-  await exec("git", ["add", "--all"], { cwd });
-  await exec("git", ["commit", "--quiet", "-m", "init"], { cwd });
-}
-
-test("tracks, diffs and verifies in a non-git directory", async () => {
-  const dir = await newTempDir("pi-undo-plain-");
-  try {
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    await mkdir(path.join(dir, "sub"));
-    await writeFile(path.join(dir, "sub", "b.txt"), "two\n");
-
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-    assert.match(before, /^[0-9a-f]{40}$/);
-
-    await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
-    await writeFile(path.join(dir, "c.txt"), "three\n");
-
-    const after = await tracked(git);
-    assert.notEqual(after, before);
-    assert.deepEqual((await git.changedFiles(before, after)).sort(), [
-      "a.txt",
-      "c.txt",
-    ]);
-    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
-
-    
-    await writeFile(path.join(dir, "a.txt"), "user edit\n");
-    assert.deepEqual((await git.dirtySinceAll(after)).manual, ["a.txt"]);
-
-    
-    await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
-    await git.restoreSnapshot(before, ["a.txt", "c.txt"]);
-    assert.equal(await readFile(path.join(dir, "a.txt"), "utf8"), "one\n");
-    await assert.rejects(readFile(path.join(dir, "c.txt")));
-    assert.equal(await git.verifySnapshot(before), true);
-
-    
-    assert.equal(await tracked(git), before);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("verifySnapshot excludes files deliberately left in the index", async () => {
-  const dir = await newTempDir("pi-undo-verify-exclude-");
-  try {
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
-    await writeFile(path.join(dir, "b.txt"), "other session\n");
-    const after = await tracked(git);
-
-    // Restore only a.txt; b.txt (another session's file) stays in the index
-    // at its after state.
-    await git.restoreSnapshot(before, ["a.txt"], after);
-    assert.equal(await readFile(path.join(dir, "a.txt"), "utf8"), "one\n");
-    assert.equal(await readFile(path.join(dir, "b.txt"), "utf8"), "other session\n");
-
-    // b.txt is still in the index but not in the before tree, so the
-    // full-tree verify fails.
-    assert.equal(await git.verifySnapshot(before), false);
-    // Excluding the deliberately-left-out file makes the verify pass.
-    assert.equal(await git.verifySnapshot(before, ["b.txt"]), true);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("gitignored files edited during the turn are snapshotted and undoable", async () => {
-  const dir = await newTempDir("pi-undo-ignore-");
-  try {
-    await writeFile(path.join(dir, ".gitignore"), "*.log\n");
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    // The turn creates a gitignored file and edits a normal one.
-    await writeFile(path.join(dir, "x.log"), "noise\n");
-    await writeFile(path.join(dir, "b.txt"), "two\n");
-    const after = await tracked(git);
-
-    // The gitignored file is part of the snapshot, so the session's edit to
-    // it is undoable.
-    assert.deepEqual((await git.changedFiles(before, after)).sort(), ["b.txt", "x.log"]);
-    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
-
-    // Undo deletes the files created during the turn, gitignored or not.
-    await git.restoreSnapshot(before, ["b.txt", "x.log"], after);
-    await assert.rejects(readFile(path.join(dir, "x.log")));
-    await assert.rejects(readFile(path.join(dir, "b.txt")));
-    assert.equal(await git.verifySnapshot(before), true);
-
-    // Redo recreates them.
-    await git.restoreSnapshot(after, ["b.txt", "x.log"]);
-    assert.equal(await readFile(path.join(dir, "x.log"), "utf8"), "noise\n");
-    assert.equal(await readFile(path.join(dir, "b.txt"), "utf8"), "two\n");
-    assert.equal(await git.verifySnapshot(after), true);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("manual edits to gitignored files are never restored and never block undo", async () => {
-  const dir = await newTempDir("pi-undo-manual-ignored-");
-  try {
-    await writeFile(path.join(dir, ".gitignore"), ".env\n");
-    await writeFile(path.join(dir, ".env"), "SECRET=manual\n");
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    // The session only touches a.txt; the gitignored .env keeps its manual
-    // edit and is not part of the message's files.
-    await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
-    const after = await tracked(git);
-
-    assert.deepEqual(await git.changedFiles(before, after), ["a.txt"]);
-    // Manual edits to gitignored files never surface as dirty.
-    await writeFile(path.join(dir, ".env"), "SECRET=edited by hand\n");
-    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
-
-    // Undo restores only the message's files; the manual .env edit survives.
-    await git.restoreSnapshot(before, ["a.txt"]);
-    assert.equal(await readFile(path.join(dir, ".env"), "utf8"), "SECRET=edited by hand\n");
-    assert.equal(await readFile(path.join(dir, "a.txt"), "utf8"), "one\n");
-    assert.equal(await git.verifySnapshot(before), true);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("undo of a gitignored file restores its pre-turn state", async () => {
-  const dir = await newTempDir("pi-undo-ignored-turn-");
-  try {
-    await writeFile(path.join(dir, ".gitignore"), ".env\n");
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    await writeFile(path.join(dir, ".env"), "SECRET=manual before turn\n");
-
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    // The session edits the gitignored file.
-    await writeFile(path.join(dir, ".env"), "SECRET=agent wrote\n");
-    const after = await tracked(git);
-    const files = await git.changedFiles(before, after);
-    assert.deepEqual(files, [".env"]);
-
-    // Undo restores the pre-turn state, which includes the manual edit.
-    await git.restoreSnapshot(before, files);
-    assert.equal(await readFile(path.join(dir, ".env"), "utf8"), "SECRET=manual before turn\n");
-    assert.equal(await git.verifySnapshot(before), true);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("rollback of a gitignored file restores it using the original skip list", async () => {
-  const dir = await newTempDir("pi-undo-rollback-ignored-");
-  try {
-    await writeFile(path.join(dir, ".gitignore"), "*.log\n");
-    await writeFile(path.join(dir, "x.log"), "one\n");
-
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    // The session edits the gitignored file.
-    await writeFile(path.join(dir, "x.log"), "two\n");
-    const after = await tracked(git);
-    assert.deepEqual(await git.changedFiles(before, after), ["x.log"]);
-
-    // A failed undo restores x.log to the before state. No manual edits
-    // existed, so nothing is skipped.
-    const first = await git.restoreSnapshot(before, ["x.log"], after);
-    assert.deepEqual(first.manualSkipped, []);
-    assert.equal(await readFile(path.join(dir, "x.log"), "utf8"), "one\n");
-
-    // Rollback must reuse the original skip list. An empty list restores
-    // x.log back to the after state instead of leaving it at "one".
-    await git.restoreSnapshot(after, ["x.log"], undefined, { manualSet: new Set(first.manualSkipped) });
-    assert.equal(await readFile(path.join(dir, "x.log"), "utf8"), "two\n");
-    assert.equal(await git.verifySnapshot(after), true);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("recomputing the skip list during rollback would skip the restored file", async () => {
-  const dir = await newTempDir("pi-undo-rollback-oldbug-");
-  try {
-    await writeFile(path.join(dir, ".gitignore"), "*.log\n");
-    await writeFile(path.join(dir, "x.log"), "one\n");
-
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-    await writeFile(path.join(dir, "x.log"), "two\n");
-    const after = await tracked(git);
-
-    await git.restoreSnapshot(before, ["x.log"], after);
-    assert.equal(await readFile(path.join(dir, "x.log"), "utf8"), "one\n");
-
-    // The old behavior recomputed the skip list from the mutated tree. Since
-    // x.log now differs from the after snapshot and is gitignored, it is
-    // classified as a manual edit and skipped.
-    const outcome = await git.restoreSnapshot(after, ["x.log"], after);
-    assert.deepEqual(outcome.manualSkipped, ["x.log"]);
-    assert.equal(await readFile(path.join(dir, "x.log"), "utf8"), "one\n");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("a gitignored file recreated by hand after a session deletion is protected", async () => {
-  const dir = await newTempDir("pi-undo-recreate-ignored-");
-  try {
-    await writeFile(path.join(dir, ".gitignore"), "*.log\n");
-    await writeFile(path.join(dir, "x.log"), "one\n");
-
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    // The session deletes the gitignored file during the message.
-    await rm(path.join(dir, "x.log"));
-    const after = await tracked(git);
-    assert.deepEqual(await git.changedFiles(before, after), ["x.log"]);
-
-    // The user recreates it by hand with different content. It is untracked
-    // AND gitignored, so --exclude-standard would hide it from the guard.
-    // The listing uses pi-undo's own exclude file instead, so it is visible.
-    await writeFile(path.join(dir, "x.log"), "recreated\n");
-    assert.deepEqual((await git.dirtySinceAll(after)).ignored, ["x.log"]);
-
-    // Undo must skip it and keep the recreated content.
-    const outcome = await git.restoreSnapshot(before, ["x.log"], after);
-    assert.deepEqual(outcome.manualSkipped, ["x.log"]);
-    assert.equal(await readFile(path.join(dir, "x.log"), "utf8"), "recreated\n");
-
-    // The non-recreated flow still restores the pre-turn content normally.
-    await rm(path.join(dir, "x.log"));
-    const second = await git.restoreSnapshot(before, ["x.log"], after);
-    assert.deepEqual(second.manualSkipped, []);
-    assert.equal(await readFile(path.join(dir, "x.log"), "utf8"), "one\n");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("untracked files over the size cap are excluded from snapshots", async () => {
-  const dir = await newTempDir("pi-undo-large-");
-  try {
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    const big = Buffer.alloc(2 * 1024 * 1024 + 1, 0x61);
-    await writeFile(path.join(dir, "big.bin"), big);
-    const after = await tracked(git);
-
-    assert.deepEqual(await git.changedFiles(before, after), []);
-    // Even though the big file is untracked, it must not show up as a manual
-    // edit: it is excluded via the exact-path large-file rule.
-    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("excludeDirectories match at any depth, not only the snapshot root", async () => {
-  const dir = await newTempDir("pi-undo-nested-excl-");
-  try {
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    await mkdir(path.join(dir, "sub", "node_modules"), { recursive: true });
-    await writeFile(path.join(dir, "sub", "node_modules", "x.js"), "one\n");
-    const big = Buffer.alloc(2 * 1024 * 1024 + 1, 0x61);
-    await writeFile(path.join(dir, "sub", "node_modules", "big.bin"), big);
-
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
-    await writeFile(path.join(dir, "sub", "node_modules", "y.js"), "two\n");
-    const after = await tracked(git);
-
-    assert.deepEqual(await git.changedFiles(before, after), ["a.txt"]);
-    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
-    // The nested files must not be part of any snapshot.
-    const files = await exec(
-      "git",
-      ["--git-dir", await findShadowGitDir(dir), "ls-files"],
-      { cwd: dir },
-    );
-    assert.ok(
-      !files.stdout.includes("node_modules"),
-      "node_modules files leaked into the index",
-    );
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("glob patterns in excludeDirectories are honored everywhere", async () => {
-  const dir = await newTempDir("pi-undo-glob-excl-");
-  try {
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    await mkdir(path.join(dir, "sub", "build-1"), { recursive: true });
-    await writeFile(path.join(dir, "sub", "build-1", "out.js"), "one\n");
-
-    const config = { excludeDirectories: ["**/build-*"], maxFiles: 5 };
-
-    // 1) Untracked files under a glob dir are not snapshotted and not dirty.
-    const git = new ShadowGit(fakePi(), dir, undefined, config);
-    await git.ensure();
-    const before = await tracked(git);
-    await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
-    await writeFile(path.join(dir, "sub", "build-1", "new.js"), "two\n");
-    const after = await tracked(git);
-    assert.deepEqual(await git.changedFiles(before, after), ["a.txt"]);
-    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
-
-    // 2) A stale tracked file under a glob dir is dropped on the next track.
-    // Stage it by hand (as if tracked before globs existed), then track.
-    const gitDir = await findShadowGitDir(dir);
-    await exec("git", ["--git-dir", gitDir, "--work-tree", dir, "add", "sub/build-1/out.js"], {
-      cwd: dir,
-    });
-    await writeFile(path.join(dir, "sub", "build-1", "out.js"), "changed\n");
-    const afterDrop = await tracked(git);
-    const files = await exec("git", ["--git-dir", gitDir, "ls-files"], { cwd: dir });
-    assert.ok(!files.stdout.includes("build-1"), "glob-covered file stayed in the index");
-    assert.deepEqual(await git.changedFiles(before, afterDrop), ["a.txt"]);
-    assert.deepEqual((await git.dirtySinceAll(afterDrop)).manual, []);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("file globs in excludeDirectories exclude files, not only directories", async () => {
-  const dir = await newTempDir("pi-undo-fileglob-excl-");
-  try {
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    await mkdir(path.join(dir, "sub"), { recursive: true });
-    await writeFile(path.join(dir, "sub", "note.tmp"), "one\n");
-
-    const git = new ShadowGit(fakePi(), dir, undefined, {
-      excludeDirectories: ["*.tmp"],
-      maxFiles: 5,
-    });
-    await git.ensure();
-    const before = await tracked(git);
-
-    await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
-    await writeFile(path.join(dir, "sub", "new.tmp"), "two\n");
-    const after = await tracked(git);
-
-    assert.deepEqual(await git.changedFiles(before, after), ["a.txt"]);
-    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("excludeDirectories entries with a trailing slash still match", async () => {
-  const dir = await newTempDir("pi-undo-slash-excl-");
-  try {
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    await mkdir(path.join(dir, "sub", "node_modules"), { recursive: true });
-    await writeFile(path.join(dir, "sub", "node_modules", "x.js"), "one\n");
-
-    // The user wrote the entry with a trailing slash in pi-undo.json. The
-    // pattern must not become "node_modules//", which git never matches.
-    const git = new ShadowGit(fakePi(), dir, undefined, {
-      excludeDirectories: ["node_modules/"],
-      maxFiles: 5,
-    });
-    await git.ensure();
-    const before = await tracked(git);
-
-    await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
-    const after = await tracked(git);
-
-    assert.deepEqual(await git.changedFiles(before, after), ["a.txt"]);
-    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("stale tracked files under excluded dirs are dropped from the index", async () => {
-  const dir = await newTempDir("pi-undo-stale-excl-");
-  try {
-    await mkdir(path.join(dir, "node_modules"), { recursive: true });
-    await writeFile(path.join(dir, "node_modules", "x.js"), "one\n");
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-
-    // First snapshot with no excludes: the file gets tracked, like it did
-    // before nested excludeDirectories worked.
-    const lax = new ShadowGit(fakePi(), dir, undefined, {
-      excludeDirectories: [],
-      maxFiles: 5,
-    });
-    await lax.ensure();
-    await lax.track();
-
-    // Now snapshot with the default excludes: the stale tracked file must be
-    // dropped and never appear in diffs or dirty checks.
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-    await writeFile(path.join(dir, "node_modules", "x.js"), "changed\n");
-    const after = await tracked(git);
-
-    assert.deepEqual(await git.changedFiles(before, after), []);
-    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("restore never reverts manual edits to gitignored files", async () => {
-  const dir = await newTempDir("pi-undo-restore-ignored-");
-  try {
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    await writeFile(path.join(dir, "out.log"), "old\n");
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    await writeFile(path.join(dir, "a.txt"), "one\ntwo\n");
-    await writeFile(path.join(dir, "out.log"), "new\n");
-    const after = await tracked(git);
-    const files = await git.changedFiles(before, after);
-    assert.deepEqual(files.sort(), ["a.txt", "out.log"]);
-
-    // The project now ignores *.log, and the user edits the file by hand
-    // after the turn. The session did edit the file, but manual edits to
-    // gitignored files are never reverted: undo leaves the file alone.
-    await writeFile(path.join(dir, ".gitignore"), "*.log\n");
-    await writeFile(path.join(dir, "out.log"), "manual edit\n");
-
-    const result = await git.restoreSnapshot(before, files, after);
-    assert.deepEqual(result.excluded, []);
-    assert.deepEqual(result.manualSkipped, ["out.log"]);
-    assert.equal(await readFile(path.join(dir, "out.log"), "utf8"), "manual edit\n");
-    assert.equal(await readFile(path.join(dir, "a.txt"), "utf8"), "one\n");
-    // Verification passes when the manual-skipped set is honored, as
-    // restoreFiles does.
-    assert.equal(
-      await git.verifySnapshot(before, [...result.skipped, ...result.excluded, ...result.manualSkipped]),
-      true,
-    );
-
-    // Redo skips it too: the manual edit keeps winning over undo and redo.
-    const redo = await git.restoreSnapshot(after, files, before);
-    assert.deepEqual(redo.manualSkipped, ["out.log"]);
-    assert.equal(await readFile(path.join(dir, "out.log"), "utf8"), "manual edit\n");
-    assert.equal(
-      await git.verifySnapshot(after, [...redo.skipped, ...redo.excluded, ...redo.manualSkipped]),
-      true,
-    );
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("undo of a gitignored file restores its pre-turn state even with manual edits", async () => {
-  const dir = await newTempDir("pi-undo-restore-ignored2-");
-  try {
-    await writeFile(path.join(dir, ".gitignore"), "out.log\n");
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    await writeFile(path.join(dir, "out.log"), "manual before turn\n");
-
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    // The session edits the gitignored file on top of the manual edit.
-    await writeFile(path.join(dir, "a.txt"), "one\ntwo\n");
-    await writeFile(path.join(dir, "out.log"), "agent wrote\n");
-    const after = await tracked(git);
-    const files = (await git.changedFiles(before, after)).sort();
-    assert.deepEqual(files, ["a.txt", "out.log"]);
-
-    // No manual edits happened since the turn, so undo restores the
-    // pre-turn state, which includes the manual edit from before the turn.
-    const result = await git.restoreSnapshot(before, files, after);
-    assert.deepEqual(result.manualSkipped, []);
-    assert.equal(await readFile(path.join(dir, "out.log"), "utf8"), "manual before turn\n");
-    assert.equal(await git.verifySnapshot(before), true);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("restore skips files that became config-excluded and keeps manual edits", async () => {
-  const dir = await newTempDir("pi-undo-restore-excl-");
-  try {
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    await writeFile(path.join(dir, "out.log"), "old\n");
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    await writeFile(path.join(dir, "a.txt"), "one\ntwo\n");
-    await writeFile(path.join(dir, "out.log"), "new\n");
-    const after = await tracked(git);
-    const files = await git.changedFiles(before, after);
-    assert.deepEqual(files.sort(), ["a.txt", "out.log"]);
-
-    // The pi-undo config now excludes *.log, and the user edits the file by
-    // hand. Restoring it from an old tree would clobber the manual edit, so
-    // pi-undo skips it, like before.
-    await writeFile(path.join(dir, "out.log"), "manual edit\n");
-    const strict = new ShadowGit(fakePi(), dir, undefined, {
-      excludeDirectories: ["*.log"],
-      maxFiles: 5,
-    });
-    await strict.ensure();
-
-    const result = await strict.restoreSnapshot(before, files);
-    assert.deepEqual(result.excluded, ["out.log"]);
-    // The manual edit survives, the rest is restored.
-    assert.equal(await readFile(path.join(dir, "out.log"), "utf8"), "manual edit\n");
-    assert.equal(await readFile(path.join(dir, "a.txt"), "utf8"), "one\n");
-    // Verification passes when the excluded set is honored, as restoreFiles does.
-    assert.equal(await strict.verifySnapshot(before, [...result.skipped, ...result.excluded]), true);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("seeds from the source repo: no blobs are stored twice", async () => {
-  const dir = await newTempDir("pi-undo-repo-");
-  try {
-    await makeSourceRepo(dir, { "a.txt": "one\n", "sub/b.txt": "two\n" });
-
-    const git = await newShadow(dir);
-
-    const before = await tracked(git);
-    assert.match(before, /^[0-9a-f]{40}$/);
-
-    
-    
-    const gitDir = await findShadowGitDir(dir);
-    const counted = await exec("git", [
-      "--git-dir",
-      gitDir,
-      "count-objects",
-      "-v",
-    ]);
-    assert.match(
-      counted.stdout,
-      /^count: 0$/m,
-      "shadow repo should reuse source objects",
-    );
-
-    
-    await writeFile(path.join(dir, "a.txt"), "one\nchanged\n");
-    const after = await tracked(git);
-    assert.deepEqual(await git.changedFiles(before, after), ["a.txt"]);
-
-    
-    await git.restoreSnapshot(before, ["a.txt"]);
-    assert.equal(await git.verifySnapshot(before), true);
-    assert.equal(await readFile(path.join(dir, "a.txt"), "utf8"), "one\n");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("source repo info/exclude files are snapshotted when the session edits them", async () => {
-  const dir = await newTempDir("pi-undo-excl-");
-  try {
-    await makeSourceRepo(dir, { "a.txt": "one\n" });
-
-    const gitDir = await exec("git", ["rev-parse", "--absolute-git-dir"], {
-      cwd: dir,
-    });
-    await writeFile(
-      path.join(gitDir.stdout.trim(), "info", "exclude"),
-      "secret.tmp\n",
-    );
-
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    // The session creates the locally-excluded file: it is snapshotted, so
-    // the edit is undoable.
-    await writeFile(path.join(dir, "secret.tmp"), "nope\n");
-    await writeFile(path.join(dir, "b.txt"), "two\n");
-    const after = await tracked(git);
-
-    assert.deepEqual((await git.changedFiles(before, after)).sort(), ["b.txt", "secret.tmp"]);
-    // Manual edits to it still never block undo.
-    await writeFile(path.join(dir, "secret.tmp"), "manual\n");
-    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("file to directory transitions restore correctly", async () => {
-  const dir = await newTempDir("pi-undo-trans-");
-  try {
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    
-    await rm(path.join(dir, "a.txt"));
-    await mkdir(path.join(dir, "a"));
-    await writeFile(path.join(dir, "a", "b.txt"), "two\n");
-
-    const after = await tracked(git);
-    const files = (await git.changedFiles(before, after)).sort();
-    assert.ok(files.includes("a.txt"));
-    assert.ok(files.includes("a/b.txt"));
-
-    await git.restoreSnapshot(before, files);
-    assert.equal(await git.verifySnapshot(before), true);
-    assert.equal(await readFile(path.join(dir, "a.txt"), "utf8"), "one\n");
-    await assert.rejects(readFile(path.join(dir, "a", "b.txt")));
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("directory to file transitions restore correctly", async () => {
-  const dir = await newTempDir("pi-undo-trans2-");
-  try {
-    await mkdir(path.join(dir, "a"));
-    await writeFile(path.join(dir, "a", "b.txt"), "two\n");
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    await rm(path.join(dir, "a"), { recursive: true });
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-
-    const after = await tracked(git);
-    const files = (await git.changedFiles(before, after)).sort();
-    assert.ok(files.includes("a/b.txt"));
-
-    await git.restoreSnapshot(before, files);
-    assert.equal(await git.verifySnapshot(before), true);
-    assert.equal(await readFile(path.join(dir, "a", "b.txt"), "utf8"), "two\n");
-    await assert.rejects(readFile(path.join(dir, "a.txt")));
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("numstat: parses add/remove stats between snapshots", async () => {
-  const dir = await newTempDir("pi-undo-numstat-");
-  try {
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    await writeFile(path.join(dir, "bin.dat"), "binary");
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    await writeFile(path.join(dir, "a.txt"), "one\ntwo\nthree\n");
-    await writeFile(path.join(dir, "bin.dat"), Buffer.alloc(64, 0x00));
-    await writeFile(path.join(dir, "c.txt"), "new\n");
-    const after = await tracked(git);
-
-    const { rows, binaryCount } = await git.diffNumstat(before, after);
-    const byFile = new Map(rows.map((row) => [row.file, row]));
-    assert.equal(byFile.get("a.txt")?.added, 2);
-    assert.equal(byFile.get("a.txt")?.removed, 0);
-    assert.equal(byFile.get("c.txt")?.added, 1);
-    assert.ok(!byFile.has("bin.dat"), "binary files are skipped");
-    assert.equal(binaryCount, 1, "binary files are counted");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("numstat: filenames containing tabs parse correctly", async () => {
-  const dir = await newTempDir("pi-undo-numtab-");
-  try {
-    await writeFile(path.join(dir, "weird\tname.txt"), "one\n");
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    await writeFile(path.join(dir, "weird\tname.txt"), "one\ntwo\n");
-    const after = await tracked(git);
-
-    const { rows } = await git.diffNumstat(before, after);
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0]?.file, "weird\tname.txt");
-    assert.equal(rows[0]?.added, 1);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("restore: never deletes or writes through a symlinked parent directory", async () => {
-  const dir = await newTempDir("pi-undo-sym-")
-  const outside = await newTempDir("pi-undo-sym-out-")
-  try {
-    await mkdir(path.join(dir, "a"))
-    await writeFile(path.join(dir, "a", "keep.txt"), "keep\n")
-    const git = await newShadow(dir)
-    const before = await tracked(git)
-
-    
-    await writeFile(path.join(dir, "a", "keep.txt"), "agent changed\n")
-    await writeFile(path.join(dir, "a", "new.txt"), "agent created\n")
-    const after = await tracked(git)
-    const files = (await git.changedFiles(before, after)).sort()
-    assert.deepEqual(files, ["a/keep.txt", "a/new.txt"])
-
-    
-    
-    await rm(path.join(dir, "a"), { recursive: true })
-    await symlink(outside, path.join(dir, "a"))
-    await writeFile(path.join(outside, "keep.txt"), "outside keep\n")
-    await writeFile(path.join(outside, "new.txt"), "outside new\n")
-
-    const result = await git.restoreSnapshot(before, files)
-    assert.deepEqual(result.skipped.sort(), ["a/keep.txt", "a/new.txt"])
-
-    
-    assert.equal(await readFile(path.join(outside, "keep.txt"), "utf8"), "outside keep\n")
-    assert.equal(await readFile(path.join(outside, "new.txt"), "utf8"), "outside new\n")
-    assert.equal((await lstat(path.join(dir, "a"))).isSymbolicLink(), true)
-
-    
-    
-    assert.equal(await git.verifySnapshot(before, result.skipped), true)
-    assert.equal(await git.verifySnapshot(before), false)
-  } finally {
-    await rm(dir, { recursive: true, force: true })
-    await rm(outside, { recursive: true, force: true })
-  }
+import assert from "node:assert/strict"
+import { lstat, mkdir, readFile, readdir, rm, symlink } from "node:fs/promises"
+import path from "node:path"
+import { test } from "node:test"
+import type { Runner } from "../src/exec.ts"
+import { parseNumstat } from "../src/git.ts"
+import { indexedPaths, makeSourceRepo, run, shadow, track, withDirs, write } from "./helpers.ts"
+
+const read = (root: string, file: string) => readFile(path.join(root, file), "utf8")
+const exists = (root: string, file: string) =>
+  lstat(path.join(root, file)).then(
+    () => true,
+    () => false,
+  )
+
+// --- tracking ---------------------------------------------------------------
+
+test("track: snapshots a plain directory and diffs two snapshots", () =>
+  withDirs(2, async (cwd, store) => {
+    await write(cwd, "a.txt", "one\n")
+    await write(cwd, "sub/b.txt", "two\n")
+    const git = await shadow(cwd, store)
+    const before = await track(git)
+    assert.match(before, /^[0-9a-f]{40}$/)
+
+    await write(cwd, "a.txt", "one\nchanged\n")
+    await write(cwd, "c.txt", "three\n")
+    const after = await track(git)
+    assert.deepEqual((await git.changedFiles(before, after)).sort(), ["a.txt", "c.txt"])
+    // Nothing changed since: the same tree comes back.
+    assert.equal(await track(git), after)
+  }))
+
+test("track: pi's own .pi directories are never snapshotted", () =>
+  withDirs(2, async (cwd, store) => {
+    const git = await shadow(cwd, store)
+    const before = await track(git)
+    await write(cwd, ".pi/settings.json", "{}\n")
+    await write(cwd, "sub/.pi/x", "x\n")
+    await write(cwd, "a.txt", "a\n")
+    assert.deepEqual(await git.changedFiles(before, await track(git)), ["a.txt"])
+  }))
+
+test("track: gitignored files are snapshotted, so the session's edits to them are undoable", () =>
+  withDirs(2, async (cwd, store) => {
+    await makeSourceRepo(cwd, { ".gitignore": "*.log\n.env\n", "a.txt": "one\n" })
+    await write(cwd, ".env", "SECRET=1\n")
+    const git = await shadow(cwd, store)
+    const before = await track(git)
+    await write(cwd, "x.log", "noise\n")
+    await write(cwd, ".env", "SECRET=2\n")
+    const after = await track(git)
+    assert.deepEqual((await git.changedFiles(before, after)).sort(), [".env", "x.log"])
+  }))
+
+test("track: files in the source repo's info/exclude are snapshotted", () =>
+  withDirs(2, async (cwd, store) => {
+    await makeSourceRepo(cwd, { "a.txt": "one\n" })
+    await write(cwd, ".git/info/exclude", "secret.tmp\n")
+    const git = await shadow(cwd, store)
+    const before = await track(git)
+    await write(cwd, "secret.tmp", "x\n")
+    assert.deepEqual(await git.changedFiles(before, await track(git)), ["secret.tmp"])
+  }))
+
+test("track: tracked files that become gitignored stay snapshotted", () =>
+  withDirs(2, async (cwd, store) => {
+    await write(cwd, "a.txt", "one\n")
+    const git = await shadow(cwd, store)
+    const before = await track(git)
+    await write(cwd, ".gitignore", "a.txt\n")
+    await write(cwd, "a.txt", "changed\n")
+    assert.deepEqual((await git.changedFiles(before, await track(git))).sort(), [".gitignore", "a.txt"])
+  }))
+
+test("track: untracked files over 2 MB are left out, even with special characters in the name", () =>
+  withDirs(2, async (cwd, store) => {
+    await write(cwd, "a.txt", "one\n")
+    const git = await shadow(cwd, store)
+    const before = await track(git)
+    const big = Buffer.alloc(2 * 1024 * 1024 + 1, 0x61)
+    await write(cwd, "big.bin", big)
+    await write(cwd, "[draft] #1!.bin", big)
+    const after = await track(git)
+    assert.deepEqual(await git.changedFiles(before, after), [])
+    // The exclude rules match the names literally, so a later small file
+    // with a similar name is not caught by them.
+    await write(cwd, "d.bin", "small\n")
+    assert.deepEqual(await git.changedFiles(after, await track(git)), ["d.bin"])
+  }))
+
+test("track: excludeDirectories match at any depth", () =>
+  withDirs(2, async (cwd, store) => {
+    await write(cwd, "a.txt", "one\n")
+    await write(cwd, "sub/node_modules/x.js", "one\n")
+    const git = await shadow(cwd, store)
+    const before = await track(git)
+    await write(cwd, "a.txt", "two\n")
+    await write(cwd, "sub/node_modules/y.js", "two\n")
+    assert.deepEqual(await git.changedFiles(before, await track(git)), ["a.txt"])
+    assert.ok(!(await indexedPaths(git)).some((file) => file.includes("node_modules")))
+  }))
+
+test("track: excludeDirectories accept globs, file globs and a trailing slash", () =>
+  withDirs(2, async (cwd, store) => {
+    await write(cwd, "a.txt", "one\n")
+    const git = await shadow(cwd, store, {
+      config: { excludeDirectories: ["**/build-*", "*.tmp", "cache/"] },
+    })
+    const before = await track(git)
+    await write(cwd, "a.txt", "two\n")
+    await write(cwd, "sub/build-1/out.js", "x\n")
+    await write(cwd, "sub/note.tmp", "x\n")
+    await write(cwd, "deep/cache/c.bin", "x\n")
+    assert.deepEqual(await git.changedFiles(before, await track(git)), ["a.txt"])
+  }))
+
+test("track: index entries that an exclude rule covers are dropped", () =>
+  withDirs(2, async (cwd, store) => {
+    await write(cwd, "a.txt", "one\n")
+    await write(cwd, "node_modules/x.js", "one\n")
+    // A store that tracked node_modules before it was excluded.
+    const lax = await shadow(cwd, store, { config: { excludeDirectories: [] } })
+    await track(lax)
+    assert.ok((await indexedPaths(lax)).includes("node_modules/x.js"))
+
+    const git = await shadow(cwd, store)
+    const before = await track(git)
+    await write(cwd, "node_modules/x.js", "changed\n")
+    assert.deepEqual(await git.changedFiles(before, await track(git)), [])
+    assert.ok(!(await indexedPaths(git)).includes("node_modules/x.js"))
+  }))
+
+test("track: config changes to excludeDirectories are honored", () =>
+  withDirs(2, async (cwd, store) => {
+    const git = await shadow(cwd, store, { config: { excludeDirectories: [] } })
+    const before = await track(git)
+    await write(cwd, "node_modules/m.js", "x\n")
+    assert.deepEqual(await git.changedFiles(before, await track(git)), ["node_modules/m.js"])
+  }))
+
+test("track: nested git repositories are skipped with a warning", () =>
+  withDirs(2, async (cwd, store) => {
+    await makeSourceRepo(cwd, { "root.txt": "one\n" })
+    await makeSourceRepo(path.join(cwd, "nested"), { "g.txt": "old\n" })
+    const warnings: string[] = []
+    const git = await shadow(cwd, store, { warnings })
+    const before = await track(git)
+    await write(cwd, "root.txt", "edited\n")
+    await write(cwd, "nested/g.txt", "edited\n")
+    assert.deepEqual(await git.changedFiles(before, await track(git)), ["root.txt"])
+    assert.equal(warnings.filter((warning) => /nested git repo/.test(warning)).length, 1, "warned once")
+  }))
+
+test("track: over maxFiles the snapshot is skipped with one warning", () =>
+  withDirs(2, async (cwd, store) => {
+    for (let i = 0; i < 6; i++) await write(cwd, `f${i}.txt`, "x\n")
+    const warnings: string[] = []
+    const git = await shadow(cwd, store, { config: { excludeDirectories: [], maxFiles: 5 }, warnings })
+    assert.equal(await git.track(), undefined)
+    assert.equal(await git.track(), undefined)
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0]!, /maxFiles/)
+  }))
+
+test("track: fifos do not break tracking", { skip: process.platform === "win32" }, () =>
+  withDirs(2, async (cwd, store) => {
+    await write(cwd, "a.txt", "one\n")
+    await run("mkfifo", [path.join(cwd, "pipe.fifo")], cwd)
+    const git = await shadow(cwd, store)
+    const before = await track(git)
+    await write(cwd, "b.txt", "two\n")
+    assert.deepEqual(await git.changedFiles(before, await track(git)), ["b.txt"])
+  }))
+
+test("track: a file created and deleted within one run leaves no trace", () =>
+  withDirs(2, async (cwd, store) => {
+    const git = await shadow(cwd, store)
+    const before = await track(git)
+    await write(cwd, "tmp.txt", "x\n")
+    await track(git)
+    await rm(path.join(cwd, "tmp.txt"))
+    assert.deepEqual(await git.changedFiles(before, await track(git)), [])
+  }))
+
+test("track: a seeded store reuses the source repo's objects", () =>
+  withDirs(2, async (cwd, store) => {
+    await makeSourceRepo(cwd, { "a.txt": "one\n", "sub/b.txt": "two\n" })
+    const git = await shadow(cwd, store)
+    await track(git)
+    const counted = await run("git", ["--git-dir", git.storeDir, "count-objects", "-v"], cwd)
+    assert.match(counted, /^count: 0$/m)
+  }))
+
+test("track: git location variables in the environment are ignored", () =>
+  withDirs(3, async (cwd, store, other) => {
+    await makeSourceRepo(other)
+    const saved = process.env.GIT_DIR
+    process.env.GIT_DIR = path.join(other, ".git")
+    try {
+      await write(cwd, "a.txt", "one\n")
+      const git = await shadow(cwd, store)
+      const before = await track(git)
+      await write(cwd, "a.txt", "two\n")
+      assert.deepEqual(await git.changedFiles(before, await track(git)), ["a.txt"])
+    } finally {
+      if (saved === undefined) delete process.env.GIT_DIR
+      else process.env.GIT_DIR = saved
+    }
+    // The other repository was never touched.
+    assert.equal(await run("git", ["status", "--porcelain"], other), "")
+  }))
+
+// --- diff stats ---------------------------------------------------------------
+
+test("diffNumstat: line counts, binary files and names with tabs", () =>
+  withDirs(2, async (cwd, store) => {
+    await write(cwd, "a.txt", "one\n")
+    await write(cwd, "bin.dat", "text")
+    await write(cwd, "tab\tname.txt", "one\n")
+    const git = await shadow(cwd, store)
+    const before = await track(git)
+    await write(cwd, "a.txt", "one\ntwo\nthree\n")
+    await write(cwd, "bin.dat", Buffer.from([0, 1, 2, 0xff, 0]))
+    await write(cwd, "tab\tname.txt", "one\ntwo\n")
+    const rows = await git.diffNumstat(before, await track(git))
+    const byFile = new Map(rows.map((row) => [row.file, row]))
+    assert.deepEqual(byFile.get("a.txt"), { file: "a.txt", added: 2, removed: 0, binary: false })
+    assert.deepEqual(byFile.get("bin.dat"), { file: "bin.dat", added: 0, removed: 0, binary: true })
+    assert.equal(byFile.get("tab\tname.txt")?.added, 1)
+  }))
+
+test("parseNumstat: skips malformed records", () => {
+  assert.deepEqual(parseNumstat("1\t2\ta.txt\0x\ty\tb.txt\0garbage\0"), [
+    { file: "a.txt", added: 1, removed: 2, binary: false },
+  ])
 })
 
-test("tracked files that become gitignored stay snapshotted", async () => {
-  const dir = await newTempDir("pi-undo-trig-");
-  try {
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    const git = await newShadow(dir);
-    const before = await tracked(git);
+// --- capture and restore ------------------------------------------------------
 
-    // The project now ignores a.txt, and the session edits it.
-    await writeFile(path.join(dir, ".gitignore"), "a.txt\n");
-    await writeFile(path.join(dir, "a.txt"), "changed\n");
-    const after = await tracked(git);
+test("restore: modified, created and deleted files go back to the snapshot", () =>
+  withDirs(2, async (cwd, store) => {
+    await write(cwd, "mod.txt", "old\n")
+    await write(cwd, "del.txt", "keep me\n")
+    const git = await shadow(cwd, store)
+    const before = await track(git)
+    await write(cwd, "mod.txt", "new\n")
+    await write(cwd, "new/deep/created.txt", "x\n")
+    await rm(path.join(cwd, "del.txt"))
+    const after = await track(git)
+    const files = await git.changedFiles(before, after)
+    assert.deepEqual(files.sort(), ["del.txt", "mod.txt", "new/deep/created.txt"])
 
-    // Still snapshotted and undoable. (.gitignore itself is snapshotted too,
-    // since the session created it.)
-    const files = (await git.changedFiles(before, after)).sort();
-    assert.deepEqual(files, [".gitignore", "a.txt"]);
-    await git.restoreSnapshot(before, files);
-    assert.equal(await readFile(path.join(dir, "a.txt"), "utf8"), "one\n");
-    assert.equal(await git.verifySnapshot(before), true);
+    await git.restore(before, files)
+    assert.equal(await read(cwd, "mod.txt"), "old\n")
+    assert.equal(await read(cwd, "del.txt"), "keep me\n")
+    // Directories that only held deleted files are removed too.
+    assert.equal(await exists(cwd, "new"), false)
+    assert.deepEqual(await git.changedFiles(before, await git.capture(files)), [])
 
-    // The project still ignores a.txt; manual edits after the turn never
-    // surface as dirty (the .gitignore file itself may, that is harmless).
-    await writeFile(path.join(dir, ".gitignore"), "a.txt\n");
-    await writeFile(path.join(dir, "a.txt"), "manual edit\n");
-    const dirty = (await git.dirtySinceAll(after)).manual;
-    assert.ok(!dirty.includes("a.txt"), "manual edits to gitignored files must not block undo");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
+    await git.restore(after, files)
+    assert.equal(await read(cwd, "mod.txt"), "new\n")
+    assert.equal(await read(cwd, "new/deep/created.txt"), "x\n")
+    assert.equal(await exists(cwd, "del.txt"), false)
+  }))
 
-test("gc runs on a seeded repo", async () => {
-  const dir = await newTempDir("pi-undo-gc-");
-  try {
-    await makeSourceRepo(dir, { "a.txt": "one\n" });
-    const git = await newShadow(dir);
-    await tracked(git);
-    await git.gcIfDue();
-    
-    await writeFile(path.join(dir, "b.txt"), "two\n");
-    const tree = await tracked(git);
-    assert.match(tree, /^[0-9a-f]{40}$/);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
+test("restore: a directory that still holds other files is kept", () =>
+  withDirs(2, async (cwd, store) => {
+    await write(cwd, "dir/keep.txt", "keep\n")
+    const git = await shadow(cwd, store)
+    const before = await track(git)
+    await write(cwd, "dir/new.txt", "x\n")
+    await git.restore(before, ["dir/new.txt"])
+    assert.equal(await read(cwd, "dir/keep.txt"), "keep\n")
+    assert.equal(await exists(cwd, "dir/new.txt"), false)
+  }))
 
-async function makeNestedRepo(parent: string, name: string, file: string, content: string): Promise<void> {
-  const dir = path.join(parent, name);
-  await mkdir(dir, { recursive: true });
-  await exec("git", ["init", "--quiet", "-b", "main"], { cwd: dir });
-  await writeFile(path.join(dir, file), content);
-  await exec("git", ["config", "user.email", "t@example.com"], { cwd: dir });
-  await exec("git", ["config", "user.name", "test"], { cwd: dir });
-  await exec("git", ["add", "--all"], { cwd: dir });
-  await exec("git", ["commit", "--quiet", "-m", "init"], { cwd: dir });
-}
+test("restore: a file replaced by a directory of the same name", () =>
+  withDirs(2, async (cwd, store) => {
+    await write(cwd, "x", "file\n")
+    const git = await shadow(cwd, store)
+    const before = await track(git)
+    await rm(path.join(cwd, "x"))
+    await write(cwd, "x/inner.txt", "dir\n")
+    const after = await track(git)
+    const files = await git.changedFiles(before, after)
+    assert.deepEqual(files.sort(), ["x", "x/inner.txt"])
 
-test("nested git repos are excluded: edits inside them are not undoable", async () => {
-  const dir = await newTempDir("pi-undo-nested-");
-  try {
-    
-    await writeFile(path.join(dir, "root.txt"), "one\n");
-    await exec("git", ["init", "--quiet"], { cwd: dir });
-    await exec("git", ["config", "user.email", "t@example.com"], { cwd: dir });
-    await exec("git", ["config", "user.name", "test"], { cwd: dir });
-    await exec("git", ["add", "--all"], { cwd: dir });
-    await exec("git", ["commit", "--quiet", "-m", "init"], { cwd: dir });
+    await git.restore(before, files)
+    assert.equal(await read(cwd, "x"), "file\n")
+    await git.restore(after, files)
+    assert.equal(await read(cwd, "x/inner.txt"), "dir\n")
+  }))
 
-    
-    await makeNestedRepo(dir, "nested", "g.txt", "old\n");
-    
-    const empty = path.join(dir, "empty");
-    await mkdir(empty, { recursive: true });
-    await exec("git", ["init", "--quiet", "-b", "main"], { cwd: empty });
-    await writeFile(path.join(empty, "f.txt"), "old\n");
+test("restore: chmod-only changes", { skip: process.platform === "win32" }, () =>
+  withDirs(2, async (cwd, store) => {
+    await write(cwd, "run.sh", "#!/bin/sh\n")
+    const git = await shadow(cwd, store)
+    const before = await track(git)
+    await run("chmod", ["+x", path.join(cwd, "run.sh")], cwd)
+    const files = await git.changedFiles(before, await track(git))
+    assert.deepEqual(files, ["run.sh"])
+    await git.restore(before, files)
+    assert.equal((await lstat(path.join(cwd, "run.sh"))).mode & 0o111, 0)
+  }))
 
-    const git = await newShadow(dir);
-    const before = await tracked(git);
+test("restore: a file deleted by hand is recreated", () =>
+  withDirs(2, async (cwd, store) => {
+    const git = await shadow(cwd, store)
+    await write(cwd, "f.txt", "content\n")
+    const after = await track(git)
+    await rm(path.join(cwd, "f.txt"))
+    await git.restore(after, ["f.txt"])
+    assert.equal(await read(cwd, "f.txt"), "content\n")
+  }))
 
-    // Nested repos are never snapshotted, so they must not be reported as
-    // manual edits either.
-    assert.deepEqual((await git.dirtySinceAll(before)).manual, []);
+test("restore: a tree from another store fails before touching any file", () =>
+  withDirs(4, async (cwdA, storeA, cwdB, storeB) => {
+    await write(cwdA, "keep.txt", "a\n")
+    const gitA = await shadow(cwdA, storeA)
+    const foreign = await track(gitA)
+    await write(cwdB, "keep.txt", "precious\n")
+    const gitB = await shadow(cwdB, storeB)
+    assert.equal(await gitB.hasTrees([foreign]), false)
+    await assert.rejects(gitB.restore(foreign, ["keep.txt"]), /not in the store/)
+    assert.equal(await read(cwdB, "keep.txt"), "precious\n")
+  }))
 
-    
-    await writeFile(path.join(dir, "root.txt"), "edited\n");
-    await writeFile(path.join(dir, "nested", "g.txt"), "edited\n");
-    await writeFile(path.join(empty, "f.txt"), "edited\n");
-    const after = await tracked(git);
+test("partition and restore never write through a symlinked directory", { skip: process.platform === "win32" }, () =>
+  withDirs(3, async (cwd, store, outside) => {
+    await write(cwd, "a/keep.txt", "keep\n")
+    const git = await shadow(cwd, store)
+    const before = await track(git)
+    await write(cwd, "a/keep.txt", "agent\n")
+    await write(cwd, "a/new.txt", "agent\n")
+    const files = await git.changedFiles(before, await track(git))
 
-    
-    assert.deepEqual(await git.changedFiles(before, after), ["root.txt"]);
-    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
+    // The directory is swapped for a symlink to somewhere outside.
+    await rm(path.join(cwd, "a"), { recursive: true })
+    await symlink(outside, path.join(cwd, "a"))
+    await write(outside, "new.txt", "outside\n")
 
-    
-    await git.restoreSnapshot(before, ["root.txt"]);
-    assert.equal(await readFile(path.join(dir, "root.txt"), "utf8"), "one\n");
-    assert.equal(await readFile(path.join(dir, "nested", "g.txt"), "utf8"), "edited\n");
-    assert.equal(await readFile(path.join(empty, "f.txt"), "utf8"), "edited\n");
-    assert.equal(await git.verifySnapshot(before), true);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
+    const { restorable, skipped } = await git.partition(files)
+    assert.deepEqual(restorable, [])
+    assert.deepEqual(skipped.map((s) => s.reason), ["symlink", "symlink"])
+    await assert.rejects(git.restore(before, files), /symlinked directory/)
+    assert.equal(await read(outside, "new.txt"), "outside\n")
+  }))
 
-test("default junk dirs are not snapshotted", async () => {
-  const dir = await newTempDir("pi-undo-junk-");
-  try {
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    await mkdir(path.join(dir, "dist"));
-    await writeFile(path.join(dir, "dist", "bundle.js"), "x\n");
+test("partition: paths excluded by config are skipped", () =>
+  withDirs(2, async (cwd, store) => {
+    const git = await shadow(cwd, store, { config: { excludeDirectories: ["*.log"] } })
+    assert.deepEqual(await git.partition(["a.txt", "x.log", "../evil", ".pi/x"]), {
+      restorable: ["a.txt"],
+      skipped: [{ path: "x.log", reason: "excluded" }],
+    })
+  }))
 
-    const git = await newShadow(dir);
-    const before = await tracked(git);
+test("capture: records the exact worktree state of the given paths", () =>
+  withDirs(2, async (cwd, store) => {
+    await write(cwd, "a.txt", "one\n")
+    await write(cwd, "b.txt", "one\n")
+    const git = await shadow(cwd, store)
+    const base = await track(git)
+    await write(cwd, "a.txt", "two\n")
+    await rm(path.join(cwd, "b.txt"))
+    await write(cwd, "c.txt", "new\n")
+    const now = await git.capture(["a.txt", "b.txt", "c.txt"])
+    assert.deepEqual((await git.changedFiles(base, now)).sort(), ["a.txt", "b.txt", "c.txt"])
+  }))
 
-    await writeFile(path.join(dir, "dist", "bundle.js"), "changed\n");
-    await writeFile(path.join(dir, "b.txt"), "two\n");
-    const after = await tracked(git);
+// --- retention ------------------------------------------------------------------
 
-    assert.deepEqual(await git.changedFiles(before, after), ["b.txt"]);
-    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
+test("protect and gc: protected snapshots survive gc, expired ones lose their refs", () =>
+  withDirs(2, async (cwd, store) => {
+    await makeSourceRepo(cwd, { "a.txt": "one\n" })
+    const git = await shadow(cwd, store)
+    const before = await track(git)
+    await write(cwd, "a.txt", "two\n")
+    const after = await track(git)
+    await git.protect([before, after])
+    await mkdir(path.join(git.storeDir, "journal"), { recursive: true })
 
-test("config: file is created with defaults when missing", async () => {
-  const dir = await newTempDir("pi-undo-config-new-");
-  try {
-    const configFile = path.join(dir, "pi-undo.json");
-    const config = loadPiUndoConfig(configFile);
-    assert.ok(config.excludeDirectories.includes("node_modules"));
-    assert.equal(config.maxFiles, 100000);
+    await git.gcIfDue()
+    assert.equal(await git.hasTrees([before, after]), true)
+    assert.equal(await exists(git.storeDir, "journal"), false, "the legacy journal is removed")
+    const refs = await run("git", ["--git-dir", git.storeDir, "for-each-ref", "--format=%(refname)"], cwd)
+    assert.equal(refs.trim().split("\n").length, 2)
 
-    const raw = JSON.parse(await readFile(configFile, "utf8")) as {
-      excludeDirectories?: unknown;
-      maxFiles?: unknown;
-    };
-    assert.ok(
-      Array.isArray(raw.excludeDirectories) &&
-        raw.excludeDirectories.includes("node_modules"),
-      "created file contains the default excludes",
-    );
-    assert.equal(raw.maxFiles, 100000);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
+    // A second gc on the same day does nothing.
+    const meta = JSON.parse(await read(git.storeDir, "meta.json")) as { lastGcAt: number }
+    await git.gcIfDue()
+    const again = JSON.parse(await read(git.storeDir, "meta.json")) as { lastGcAt: number }
+    assert.equal(again.lastGcAt, meta.lastGcAt)
 
-test("config: user edits to excludeDirectories and maxFiles are honored", async () => {
-  const dir = await newTempDir("pi-undo-config-edit-");
-  try {
-    const configFile = path.join(dir, "pi-undo.json");
-    await writeFile(
-      configFile,
-      JSON.stringify({ excludeDirectories: ["Downloads", "tmp"], maxFiles: 7 }),
-    );
-    const config = loadPiUndoConfig(configFile);
-    assert.deepEqual(config.excludeDirectories, ["Downloads", "tmp"]);
-    assert.equal(config.maxFiles, 7);
+    // With a tiny retention, the next gc deletes the refs.
+    const strict = await shadow(cwd, store, { config: { retentionDays: 1e-9 } })
+    await write(git.storeDir, "meta.json", JSON.stringify({ ...again, lastGcAt: 0 }))
+    await strict.gcIfDue()
+    const left = await run("git", ["--git-dir", git.storeDir, "for-each-ref", "--format=%(refname)"], cwd)
+    assert.equal(left.trim(), "")
+  }))
 
-    // A directory named in the file is excluded from snapshots.
-    await mkdir(path.join(dir, "Downloads"));
-    await writeFile(path.join(dir, "Downloads", "d.txt"), "x\n");
-    const git = new ShadowGit(fakePi(), dir, undefined, config);
-    await git.ensure();
-    const before = await tracked(git);
+test("gc: a seeded store still snapshots afterwards", () =>
+  withDirs(2, async (cwd, store) => {
+    await makeSourceRepo(cwd, { "a.txt": "one\n" })
+    const git = await shadow(cwd, store)
+    await track(git)
+    await git.gcIfDue()
+    await write(cwd, "b.txt", "two\n")
+    assert.match(await track(git), /^[0-9a-f]{40}$/)
+  }))
 
-    await writeFile(path.join(dir, "Downloads", "d.txt"), "y\n");
-    await writeFile(path.join(dir, "b.txt"), "two\n");
-    const after = await tracked(git);
-    assert.deepEqual(await git.changedFiles(before, after), ["b.txt"]);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
+// --- robustness -----------------------------------------------------------------
 
-test("config: empty excludeDirectories re-enables default dirs", async () => {
-  const dir = await newTempDir("pi-undo-config-empty-");
-  try {
-    const configFile = path.join(dir, "pi-undo.json");
-    await writeFile(configFile, JSON.stringify({ excludeDirectories: [] }));
-    const config = loadPiUndoConfig(configFile);
-    assert.deepEqual(config.excludeDirectories, []);
-
-    // node_modules is tracked again once the user removed it.
-    const git = new ShadowGit(fakePi(), dir, undefined, config);
-    await git.ensure();
-    const before = await tracked(git);
-    await mkdir(path.join(dir, "node_modules"));
-    await writeFile(path.join(dir, "node_modules", "m.js"), "x\n");
-    const after = await tracked(git);
-    assert.deepEqual(await git.changedFiles(before, after), ["node_modules/m.js"]);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("config: invalid values fall back to defaults", async () => {
-  const dir = await newTempDir("pi-undo-config-invalid-");
-  try {
-    const configFile = path.join(dir, "pi-undo.json");
-    await writeFile(
-      configFile,
-      JSON.stringify({ excludeDirectories: "nope", maxFiles: -3 }),
-    );
-    const config = loadPiUndoConfig(configFile);
-    assert.ok(config.excludeDirectories.includes("node_modules"));
-    assert.equal(config.maxFiles, 100000);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("file cap skips snapshots with a warning", async () => {
-  const dir = await newTempDir("pi-undo-cap-");
-  try {
-    for (let i = 0; i < 6; i++) {
-      await writeFile(path.join(dir, `f${i}.txt`), "x\n");
+test("git commands retry while another process holds the index lock", () =>
+  withDirs(2, async (cwd, store) => {
+    const { runProcess } = await import("../src/exec.ts")
+    let locked = 2
+    const runner: Runner = async (command, args, options) => {
+      if (args.includes("write-tree") && locked > 0) {
+        locked--
+        return { code: 128, stdout: "", stderr: "fatal: Unable to create '/x/index.lock': File exists.\n" }
+      }
+      return runProcess(command, args, options)
     }
-    const git = new ShadowGit(fakePi(), dir, undefined, { excludeDirectories: [], maxFiles: 5 });
-    await git.ensure();
-    assert.equal(await git.track(), undefined);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
+    await write(cwd, "a.txt", "one\n")
+    const git = await shadow(cwd, store, { runner })
+    assert.match(await track(git), /^[0-9a-f]{40}$/)
+    assert.equal(locked, 0)
+  }))
 
-test("binary files are tracked, shown as binary in stats, and restored", async () => {
-  const dir = await newTempDir("pi-undo-binary-");
-  try {
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    const bin = Buffer.from([0x00, 0x01, 0x02, 0xff, 0x00]);
-    await writeFile(path.join(dir, "blob.bin"), bin);
-    const after = await tracked(git);
-
-    assert.deepEqual(await git.changedFiles(before, after), ["blob.bin"]);
-    const stats = await git.diffNumstat(before, after);
-    assert.equal(stats.binaryCount, 1);
-    assert.deepEqual(stats.rows, []);
-
-    await git.restoreSnapshot(before, ["blob.bin"]);
-    await assert.rejects(readFile(path.join(dir, "blob.bin")));
-    assert.equal(await git.verifySnapshot(before), true);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("file created and deleted within one message leaves no trace", async () => {
-  const dir = await newTempDir("pi-undo-createdelete-");
-  try {
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    await writeFile(path.join(dir, "tmp.txt"), "x\n");
-    const mid = await tracked(git);
-    assert.deepEqual(await git.changedFiles(before, mid), ["tmp.txt"]);
-
-    await rm(path.join(dir, "tmp.txt"));
-    const after = await tracked(git);
-    assert.deepEqual(await git.changedFiles(before, after), []);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("a file deleted by hand after the turn is recreated by restore", async () => {
-  const dir = await newTempDir("pi-undo-recreate-");
-  try {
-    const git = await newShadow(dir);
-    await tracked(git);
-
-    await writeFile(path.join(dir, "f.txt"), "content\n");
-    const after = await tracked(git);
-
-    await rm(path.join(dir, "f.txt"));
-    await git.restoreSnapshot(after, ["f.txt"]);
-    assert.equal(await readFile(path.join(dir, "f.txt"), "utf8"), "content\n");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("chmod-only changes are detected and restored", async () => {
-  const dir = await newTempDir("pi-undo-chmod-");
-  try {
-    await writeFile(path.join(dir, "run.sh"), "#!/bin/sh\necho hi\n");
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    await exec("chmod", ["+x", path.join(dir, "run.sh")]);
-    const after = await tracked(git);
-    assert.deepEqual(await git.changedFiles(before, after), ["run.sh"]);
-
-    await git.restoreSnapshot(before, ["run.sh"]);
-    const st = await lstat(path.join(dir, "run.sh"));
-    assert.equal(st.mode & 0o111, 0, "executable bit is restored");
-    assert.equal(await git.verifySnapshot(before), true);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("fifos in the worktree do not break tracking", async () => {
-  const dir = await newTempDir("pi-undo-fifo-");
-  try {
-    await writeFile(path.join(dir, "a.txt"), "one\n");
-    if (process.platform !== "win32") {
-      await exec("mkfifo", [path.join(dir, "pipe.fifo")]);
-    }
-    const git = await newShadow(dir);
-    const before = await tracked(git);
-
-    await writeFile(path.join(dir, "b.txt"), "two\n");
-    const after = await tracked(git);
-    assert.deepEqual(await git.changedFiles(before, after), ["b.txt"]);
-    assert.deepEqual((await git.dirtySinceAll(after)).manual, []);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("restore from a store for another directory fails without deleting files", async () => {
-  const dirA = await newTempDir("pi-undo-cross-a-");
-  const dirB = await newTempDir("pi-undo-cross-b-");
-  try {
-    await writeFile(path.join(dirA, "keep.txt"), "precious\n");
-    const gitA = await newShadow(dirA);
-    const before = await tracked(gitA);
-    await writeFile(path.join(dirA, "keep.txt"), "edited\n");
-    const after = await tracked(gitA);
-    assert.deepEqual(await gitA.changedFiles(before, after), ["keep.txt"]);
-
-    // A second session in another directory cannot see dirA's trees.
-    await writeFile(path.join(dirB, "keep.txt"), "precious\n");
-    const gitB = await newShadow(dirB);
-    await assert.rejects(
-      gitB.restoreSnapshot(before!, ["keep.txt"]),
-      /snapshot tree not found/,
-    );
-    assert.equal(await readFile(path.join(dirB, "keep.txt"), "utf8"), "precious\n");
-  } finally {
-    await rm(dirA, { recursive: true, force: true });
-    await rm(dirB, { recursive: true, force: true });
-  }
-});
-
-async function findShadowGitDir(cwd: string): Promise<string> {
-  const storeRoot = snapshotStoreRoot();
-  const { readdir } = await import("node:fs/promises");
-  const dirs = await readdir(storeRoot);
-  for (const dir of dirs) {
-    const metaFile = path.join(storeRoot, dir, "meta.json");
-    try {
-      const meta = JSON.parse(await readFile(metaFile, "utf8")) as {
-        cwd?: string;
-      };
-      if (meta.cwd === cwd) return path.join(storeRoot, dir);
-    } catch {
-      
-    }
-  }
-  throw new Error(`no shadow store found for ${cwd}`);
-}
+test("concurrent calls on one repo are serialized", () =>
+  withDirs(2, async (cwd, store) => {
+    for (let i = 0; i < 20; i++) await write(cwd, `f${i}.txt`, `${i}\n`)
+    const git = await shadow(cwd, store)
+    const base = await track(git)
+    for (let i = 0; i < 20; i++) await write(cwd, `f${i}.txt`, `changed ${i}\n`)
+    const trees = await Promise.all([git.track(), git.track(), git.capture(["f1.txt"]), git.track()])
+    assert.ok(trees.every((tree) => typeof tree === "string"))
+    assert.equal((await git.changedFiles(base, trees[3]!)).length, 20)
+    assert.deepEqual(await readdir(cwd).then((names) => names.length), 20)
+  }))

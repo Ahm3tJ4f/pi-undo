@@ -1,60 +1,61 @@
-import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import { test } from "node:test";
+import assert from "node:assert/strict"
+import { readFile, writeFile } from "node:fs/promises"
+import path from "node:path"
+import { test } from "node:test"
+import ignore from "ignore"
+import { DEFAULT_CONFIG, DEFAULT_EXCLUDE_DIRECTORIES, loadPiUndoConfig } from "../src/config.ts"
+import { withDirs } from "./helpers.ts"
 
-import ignore from "ignore";
+test("config: a missing file is created with the defaults", () =>
+  withDirs(1, async (dir) => {
+    const file = path.join(dir, "nested", "pi-undo.json")
+    assert.deepEqual(loadPiUndoConfig(file), DEFAULT_CONFIG)
+    assert.deepEqual(JSON.parse(await readFile(file, "utf8")), DEFAULT_CONFIG)
+  }))
 
-import {
-  DEFAULT_EXCLUDE_DIRECTORIES,
-  DEFAULT_CONFIG,
-  loadPiUndoConfig,
-} from "../src/config.ts";
+test("config: values in the file replace the defaults", () =>
+  withDirs(1, async (dir) => {
+    const file = path.join(dir, "pi-undo.json")
+    await writeFile(file, JSON.stringify({ excludeDirectories: ["Downloads"], maxFiles: 7.9, retentionDays: 3 }))
+    assert.deepEqual(loadPiUndoConfig(file), { excludeDirectories: ["Downloads"], maxFiles: 7, retentionDays: 3 })
+  }))
 
-const NEW_CACHE_PATTERNS = [
-  "__pycache__",
-  "*.pyc",
-  "*.pyo",
-  ".pytest_cache",
-  ".mypy_cache",
-  ".ruff_cache",
-  ".tox",
-  ".turbo",
-  ".parcel-cache",
-  ".vite",
-];
+test("config: an empty exclude list really excludes nothing", () =>
+  withDirs(1, async (dir) => {
+    const file = path.join(dir, "pi-undo.json")
+    await writeFile(file, JSON.stringify({ excludeDirectories: [] }))
+    assert.deepEqual(loadPiUndoConfig(file).excludeDirectories, [])
+  }))
 
-test("config: default excludes contain every new cache pattern", () => {
-  for (const entry of NEW_CACHE_PATTERNS) {
-    assert.ok(
-      DEFAULT_EXCLUDE_DIRECTORIES.includes(entry),
-      `missing default exclude: ${entry}`,
-    );
-  }
-});
+test("config: invalid values and invalid JSON fall back to the defaults", () =>
+  withDirs(1, async (dir) => {
+    const file = path.join(dir, "pi-undo.json")
+    await writeFile(file, JSON.stringify({ excludeDirectories: "nope", maxFiles: -3, retentionDays: "x" }))
+    assert.deepEqual(loadPiUndoConfig(file), DEFAULT_CONFIG)
+    await writeFile(file, JSON.stringify({ excludeDirectories: ["ok", 5, "  "] }))
+    assert.deepEqual(loadPiUndoConfig(file).excludeDirectories, ["ok"])
+    await writeFile(file, "{ not json")
+    assert.deepEqual(loadPiUndoConfig(file), DEFAULT_CONFIG)
+    await writeFile(file, "null")
+    assert.deepEqual(loadPiUndoConfig(file), DEFAULT_CONFIG)
+  }))
 
 test("config: default excludes have no duplicates", () => {
-  assert.deepEqual(
-    new Set(DEFAULT_EXCLUDE_DIRECTORIES).size,
-    DEFAULT_EXCLUDE_DIRECTORIES.length,
-    "duplicate entry found in DEFAULT_EXCLUDE_DIRECTORIES",
-  );
-});
+  assert.equal(new Set(DEFAULT_EXCLUDE_DIRECTORIES).size, DEFAULT_EXCLUDE_DIRECTORIES.length)
+})
 
-test("config: loadPiUndoConfig returns defaults when the file does not exist", async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), "pi-undo-config-test-"));
-  const file = path.join(dir, "pi-undo.json");
-  try {
-    const config = loadPiUndoConfig(file);
-    assert.deepEqual(config, DEFAULT_CONFIG);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
+test("config: default cache patterns match at any depth", () => {
+  const matcher = ignore().add(DEFAULT_EXCLUDE_DIRECTORIES)
+  for (const file of [
+    "node_modules/x.js",
+    "a/b/node_modules/x.js",
+    "pkg/__pycache__/m.cpython-312.pyc",
+    "src/mod.pyc",
+    "x/.pytest_cache/v/cache",
+    "web/.turbo/log",
+    "app/.vite/deps/a.js",
+  ]) {
+    assert.ok(matcher.ignores(file), file)
   }
-});
-
-test("config: cache patterns match at any depth", () => {
-  const matcher = ignore().add(DEFAULT_EXCLUDE_DIRECTORIES);
-  assert.ok(matcher.ignores("pkg/__pycache__/x.pyc"));
-  assert.ok(matcher.ignores("src/a.pyc"));
-});
+  assert.ok(!matcher.ignores("src/index.ts"))
+})
