@@ -50,7 +50,7 @@ function loadExtension(cwd: string) {
   }
   let turn = 0
   // One agent run: the prompt, then `work` changes files.
-  const prompt = async (text: string, work: () => Promise<void>) => {
+  const prompt = async (text: string, work: () => Promise<void>, settled = true) => {
     turn++
     await emit("before_agent_start", { prompt: text })
     idle = false
@@ -59,7 +59,7 @@ function loadExtension(cwd: string) {
     await work()
     session.append(assistantEntry(`a${turn}`))
     idle = true
-    await emit("agent_settled", {})
+    if (settled) await emit("agent_settled", {})
   }
   const command = (name: string) => commands.get(name)!("", ctx)
   return { emit, prompt, command, ui, session, appended }
@@ -132,4 +132,18 @@ test("extension: undo and redo survive a restart", () =>
     await second.emit("session_start", { reason: "resume" })
     await second.command("redo")
     assert.equal(await readFile(path.join(cwd, "a.txt"), "utf8"), "1\n")
+  }))
+
+test("extension: a run without agent_settled still gets its own checkpoint", () =>
+  withDirs(2, async (cwd, store) => {
+    process.env.PI_UNDO_STORE_ROOT = store
+    const pi = loadExtension(cwd)
+    await pi.emit("session_start", { reason: "startup" })
+    await pi.prompt("one", () => write(cwd, "a.txt", "1\n"), false)
+    await pi.prompt("two", () => write(cwd, "b.txt", "2\n"))
+    await pi.command("undo")
+    assert.equal(await readFile(path.join(cwd, "a.txt"), "utf8"), "1\n")
+    await assert.rejects(readFile(path.join(cwd, "b.txt")))
+    await pi.command("undo")
+    await assert.rejects(readFile(path.join(cwd, "a.txt")))
   }))

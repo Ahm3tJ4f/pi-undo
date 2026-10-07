@@ -44,7 +44,10 @@ export default function piUndo(pi: ExtensionAPI): void {
     repo = undefined
   })
 
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
+    // A new prompt means the previous run is over, even if its
+    // agent_settled never arrived.
+    await tracker.flush(ctx)
     tracker.notePrompt(event.prompt, event.images?.length ?? 0)
   })
 

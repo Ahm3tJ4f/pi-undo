@@ -160,6 +160,20 @@ test("tracker: flush does not end a run that is still going", async () => {
   assert.equal(h.store.get("u1"), undefined)
 })
 
+test("tracker: a run whose agent_settled never came is recorded before the next prompt", async () => {
+  const h = setup()
+  h.setIdle(false)
+  await h.tracker.start(h.ctx)
+  h.session.append(userEntry("u1"))
+  h.repo.worktree.set("a.txt", "x")
+  h.setIdle(true)
+  // No agent_settled. The next prompt flushes before it is noted.
+  await h.tracker.flush(h.ctx)
+  await runTurn(h, "u2", { "b.txt": "y" })
+  assert.deepEqual(h.store.get("u1")?.snapshot?.files, ["a.txt"])
+  assert.deepEqual(h.store.get("u2")?.snapshot?.files, ["b.txt"])
+})
+
 test("findRunStart: first user or custom message after the start leaf", () => {
   const branch = [
     entry("m0", "model_change"),
