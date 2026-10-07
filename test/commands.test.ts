@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { diff, redo, undo, type CommandContext, type CommandDeps } from "../src/commands.ts"
+import { type CommandContext, type CommandDeps, diff, redo, undo } from "../src/commands.ts"
 import { CheckpointStore } from "../src/store.ts"
 import { TurnTracker } from "../src/tracker.ts"
 import type { Checkpoint } from "../src/types.ts"
@@ -46,7 +46,12 @@ function setup(options: Options = {}) {
 
 type Harness = ReturnType<typeof setup>
 
-function addCheckpoint(h: Harness, before: Record<string, string>, after: Record<string, string>, extra: Partial<Checkpoint> = {}) {
+function addCheckpoint(
+  h: Harness,
+  before: Record<string, string>,
+  after: Record<string, string>,
+  extra: Partial<Checkpoint> = {},
+) {
   const beforeTree = h.repo.store(new Map(Object.entries(before)))
   const afterTree = h.repo.store(new Map(Object.entries(after)))
   for (const [file, content] of Object.entries(after)) h.repo.worktree.set(file, content)
@@ -272,7 +277,7 @@ test("diff: shows the changes and the manual edits", async () => {
   await diff(h.deps, h.ctx)
   const text = messages(h)[0]!
   assert.match(text, /what \/undo rolls back/)
-  assert.match(text, /a\.txt  \+1\/-1/)
+  assert.match(text, /a\.txt {2}\+1\/-1/)
   assert.match(text, /These changes will be lost:\nb\.txt/)
   assert.equal(h.repo.worktree.get("b.txt"), "edited by hand", "diff changes nothing")
 })

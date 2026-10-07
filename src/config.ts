@@ -99,7 +99,7 @@ export function loadPiUndoConfig(globalPath?: string): PiUndoConfig {
 function writeDefaults(file: string): void {
   try {
     mkdirSync(path.dirname(file), { recursive: true })
-    writeFileSync(file, JSON.stringify(DEFAULT_CONFIG, null, 2) + "\n")
+    writeFileSync(file, `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`)
   } catch {
     // Best effort: if the file cannot be created, the in-memory defaults are
     // still used.

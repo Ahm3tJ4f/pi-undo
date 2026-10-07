@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import type { PiUndoConfig } from "../src/config.ts"
 import { DEFAULT_CONFIG } from "../src/config.ts"
-import { runProcess, type Runner } from "../src/exec.ts"
+import { type Runner, runProcess } from "../src/exec.ts"
 import { ShadowGit } from "../src/git.ts"
 
 // Runs `fn` with fresh temp directories and removes them afterwards.

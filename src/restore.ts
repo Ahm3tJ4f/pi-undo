@@ -86,12 +86,7 @@ async function verify(repo: SnapshotRepo, tree: string, paths: readonly string[]
   }
 }
 
-async function changedPaths(
-  repo: SnapshotRepo,
-  from: string,
-  to: string,
-  paths: readonly string[],
-): Promise<string[]> {
+async function changedPaths(repo: SnapshotRepo, from: string, to: string, paths: readonly string[]): Promise<string[]> {
   if (from === to) return []
   const wanted = new Set(paths)
   return (await repo.changedFiles(from, to)).filter((file) => wanted.has(file))

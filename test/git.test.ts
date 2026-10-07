@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { lstat, mkdir, readFile, readdir, rm, symlink } from "node:fs/promises"
+import { lstat, mkdir, readdir, readFile, rm, symlink } from "node:fs/promises"
 import path from "node:path"
 import { test } from "node:test"
 import type { Runner } from "../src/exec.ts"
@@ -171,7 +171,8 @@ test("track: fifos do not break tracking", { skip: process.platform === "win32" 
     const before = await track(git)
     await write(cwd, "b.txt", "two\n")
     assert.deepEqual(await git.changedFiles(before, await track(git)), ["b.txt"])
-  }))
+  }),
+)
 
 test("track: a file created and deleted within one run leaves no trace", () =>
   withDirs(2, async (cwd, store) => {
@@ -361,7 +362,8 @@ test("restore: chmod-only changes", { skip: process.platform === "win32" }, () =
     assert.deepEqual(files, ["run.sh"])
     await git.restore(before, files)
     assert.equal((await lstat(path.join(cwd, "run.sh"))).mode & 0o111, 0)
-  }))
+  }),
+)
 
 test("restore: a file deleted by hand is recreated", () =>
   withDirs(2, async (cwd, store) => {
@@ -401,10 +403,14 @@ test("partition and restore never write through a symlinked directory", { skip: 
 
     const { restorable, skipped } = await git.partition(files)
     assert.deepEqual(restorable, [])
-    assert.deepEqual(skipped.map((s) => s.reason), ["symlink", "symlink"])
+    assert.deepEqual(
+      skipped.map((s) => s.reason),
+      ["symlink", "symlink"],
+    )
     await assert.rejects(git.restore(before, files), /symlinked directory/)
     assert.equal(await read(outside, "new.txt"), "outside\n")
-  }))
+  }),
+)
 
 test("partition: paths excluded by config are skipped", () =>
   withDirs(2, async (cwd, store) => {

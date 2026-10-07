@@ -4,7 +4,7 @@ import path from "node:path"
 import { test } from "node:test"
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import piUndo from "../src/index.ts"
-import { assistantEntry, fakeSession, fakeUi, userEntry, type FakeSession } from "./fakes.ts"
+import { assistantEntry, type FakeSession, fakeSession, fakeUi, userEntry } from "./fakes.ts"
 import { withDirs, write } from "./helpers.ts"
 
 type Handler = (event: unknown, ctx: unknown) => unknown

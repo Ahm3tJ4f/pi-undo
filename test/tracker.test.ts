@@ -1,8 +1,8 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { CheckpointStore } from "../src/store.ts"
-import { findRunStart, TurnTracker, type TrackerContext } from "../src/tracker.ts"
-import { assistantEntry, entry, FakeRepo, fakeSession, userEntry, type FakeSession } from "./fakes.ts"
+import { findRunStart, type TrackerContext, TurnTracker } from "../src/tracker.ts"
+import { assistantEntry, entry, FakeRepo, type FakeSession, fakeSession, userEntry } from "./fakes.ts"
 
 function setup(initial = [entry("m0", "model_change")]) {
   const repo = new FakeRepo()

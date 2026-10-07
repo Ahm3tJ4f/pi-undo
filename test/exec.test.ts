@@ -7,9 +7,13 @@ import { Mutex } from "../src/mutex.ts"
 const cwd = tmpdir()
 
 test("runProcess: returns stdout, stderr and the exit code", async () => {
-  const result = await runProcess("node", ["-e", "process.stdout.write('out'); process.stderr.write('err'); process.exit(3)"], {
-    cwd,
-  })
+  const result = await runProcess(
+    "node",
+    ["-e", "process.stdout.write('out'); process.stderr.write('err'); process.exit(3)"],
+    {
+      cwd,
+    },
+  )
   assert.deepEqual(result, { code: 3, stdout: "out", stderr: "err" })
 })
 

@@ -1,9 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
-import { registerCommands, type CommandDeps } from "./commands.ts"
+import { type CommandDeps, registerCommands } from "./commands.ts"
 import { loadPiUndoConfig } from "./config.ts"
 import { ShadowGit } from "./git.ts"
 import { CheckpointStore } from "./store.ts"
-import { TurnTracker, type RepoProvider } from "./tracker.ts"
+import { type RepoProvider, TurnTracker } from "./tracker.ts"
 import { errorMessage } from "./util.ts"
 
 export default function piUndo(pi: ExtensionAPI): void {

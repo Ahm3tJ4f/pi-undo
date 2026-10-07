@@ -44,7 +44,9 @@ export class FakeRepo implements SnapshotRepo {
   async partition(paths: readonly string[]): Promise<Partition> {
     return {
       restorable: paths.filter((file) => !this.excluded.has(file)),
-      skipped: paths.filter((file) => this.excluded.has(file)).map((file) => ({ path: file, reason: "excluded" as const })),
+      skipped: paths
+        .filter((file) => this.excluded.has(file))
+        .map((file) => ({ path: file, reason: "excluded" as const })),
     }
   }
 

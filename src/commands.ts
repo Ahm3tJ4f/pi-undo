@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent"
 import type { SkippedPath, SkipReason, SnapshotRepo } from "./git.ts"
-import { applyRestore, planRestore, RestoreError, rollback, type RestorePlan } from "./restore.ts"
+import { applyRestore, planRestore, RestoreError, type RestorePlan, rollback } from "./restore.ts"
 import type { CheckpointStore } from "./store.ts"
 import type { RepoProvider, TrackerContext, TurnTracker } from "./tracker.ts"
 import type { Checkpoint } from "./types.ts"
@@ -92,7 +92,10 @@ export async function diff(deps: CommandDeps, ctx: CommandContext): Promise<void
     const repo = deps.repoFor(ctx)
     const { before, after, files } = checkpoint.snapshot
     if (!(await repo.hasTrees([before, after]))) {
-      ctx.ui.notify(`${header}The file snapshots of the last message are gone; /undo can roll back the conversation only`, "info")
+      ctx.ui.notify(
+        `${header}The file snapshots of the last message are gone; /undo can roll back the conversation only`,
+        "info",
+      )
       return
     }
     const rows = await repo.diffNumstat(before, after)
@@ -125,7 +128,12 @@ interface Restored {
 // (redo) the checkpoint's message. Files first: if the files cannot be
 // restored, the conversation stays where it is. If the conversation cannot
 // move, the files are rolled back.
-async function revert(deps: CommandDeps, ctx: CommandContext, checkpoint: Checkpoint, direction: Direction): Promise<void> {
+async function revert(
+  deps: CommandDeps,
+  ctx: CommandContext,
+  checkpoint: Checkpoint,
+  direction: Direction,
+): Promise<void> {
   const words = WORDS[direction]
   const notes: string[] = []
   let restored: Restored | undefined
@@ -144,7 +152,8 @@ async function revert(deps: CommandDeps, ctx: CommandContext, checkpoint: Checkp
   const navigationError = await navigate(deps, ctx, direction === "undo" ? checkpoint.entryId : checkpoint.finalLeafId)
   if (navigationError !== undefined) {
     const rolledBack = restored ? await rollback(restored.repo, restored.plan) : true
-    const reason = navigationError === "cancelled" ? `${words.name} cancelled` : `${words.name} failed: ${navigationError}`
+    const reason =
+      navigationError === "cancelled" ? `${words.name} cancelled` : `${words.name} failed: ${navigationError}`
     ctx.ui.notify(
       rolledBack
         ? reason
@@ -184,7 +193,11 @@ async function restoreFiles(
   const words = WORDS[direction]
   if (!checkpoint.snapshot) {
     if (!checkpoint.unavailable) return undefined
-    const ok = await confirmConversationOnly(ctx, words.name, `This message has no file snapshot: ${checkpoint.unavailable}.`)
+    const ok = await confirmConversationOnly(
+      ctx,
+      words.name,
+      `This message has no file snapshot: ${checkpoint.unavailable}.`,
+    )
     if (!ok) return "cancelled"
     notes.push("Files were not restored: the message has no file snapshot.")
     return undefined
@@ -220,7 +233,10 @@ async function restoreFiles(
 
 async function confirmConversationOnly(ctx: CommandContext, name: string, reason: string): Promise<boolean> {
   if (!ctx.hasUI) return true
-  return ctx.ui.confirm(`${name} message`, `${reason}\n\n${name} the conversation only and leave the files as they are?`)
+  return ctx.ui.confirm(
+    `${name} message`,
+    `${reason}\n\n${name} the conversation only and leave the files as they are?`,
+  )
 }
 
 async function navigate(deps: CommandDeps, ctx: CommandContext, targetId: string): Promise<string | undefined> {

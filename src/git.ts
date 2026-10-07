@@ -5,19 +5,19 @@ import path from "node:path"
 import { getAgentDir } from "@earendil-works/pi-coding-agent"
 import ignore, { type Ignore } from "ignore"
 import { DEFAULT_CONFIG, type PiUndoConfig } from "./config.ts"
-import { runProcess, type Runner } from "./exec.ts"
+import { type Runner, runProcess } from "./exec.ts"
 import { Mutex } from "./mutex.ts"
 import {
   errorMessage,
   gitignoreLiteral,
   listInline,
   literalPathspec,
+  type NumstatRow,
   normalizeGitPaths,
   nulSplit,
   pathspecInput,
   toPosix,
   unique,
-  type NumstatRow,
 } from "./util.ts"
 
 // Untracked files above this size are never snapshotted.
@@ -374,9 +374,12 @@ export class ShadowGit implements SnapshotRepo {
 
   private async unstage(paths: string[]): Promise<void> {
     if (paths.length === 0) return
-    await this.git(["rm", "--cached", "-r", "-q", "--ignore-unmatch", "--pathspec-from-file=-", "--pathspec-file-nul"], {
-      input: pathspecInput(paths),
-    })
+    await this.git(
+      ["rm", "--cached", "-r", "-q", "--ignore-unmatch", "--pathspec-from-file=-", "--pathspec-file-nul"],
+      {
+        input: pathspecInput(paths),
+      },
+    )
   }
 
   private async restorePaths(tree: string, paths: string[]): Promise<void> {
@@ -519,12 +522,10 @@ export class ShadowGit implements SnapshotRepo {
   private async expireSnapshotRefs(): Promise<void> {
     const cutoff = Date.now() - this.config.retentionDays * DAY_MS
     const result = await this.git(["for-each-ref", "--format=%(refname)", SNAPSHOT_REF_PREFIX])
-    const expired = result.stdout
-      .split("\n")
-      .filter((ref) => {
-        const stamp = Number.parseInt(ref.slice(SNAPSHOT_REF_PREFIX.length), 10)
-        return Number.isFinite(stamp) && stamp < cutoff
-      })
+    const expired = result.stdout.split("\n").filter((ref) => {
+      const stamp = Number.parseInt(ref.slice(SNAPSHOT_REF_PREFIX.length), 10)
+      return Number.isFinite(stamp) && stamp < cutoff
+    })
     if (expired.length === 0) return
     await this.git(["update-ref", "--stdin"], { input: expired.map((ref) => `delete ${ref}\n`).join("") })
   }
