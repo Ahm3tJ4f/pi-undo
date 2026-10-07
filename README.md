@@ -4,81 +4,87 @@
 [![npm downloads](https://img.shields.io/npm/dm/@ahm3tj4f/pi-undo)](https://www.npmjs.com/package/@ahm3tj4f/pi-undo)
 [![license](https://img.shields.io/npm/l/@ahm3tj4f/pi-undo)](https://github.com/ahm3tj4f/pi-undo/blob/main/LICENSE)
 
-Undo/redo for pi. But this time it works.
+Undo and redo for [pi](https://github.com/earendil-works/pi). One command rolls back the last message: the conversation and the files that the message changed.
 
-This is a port of OpenCode's exact undo/redo philosophy: snapshot the files
-per message with a shadow git repo, restore only what that message changed,
-and never lose your work in the process.
-
-## How it works
-
-Each user message gets two git tree hashes: one before the turn, one after.
-The trees live in a shadow repo under `~/.pi/agent/pi-undo/snapshots/`.
-The checkpoints are persisted in the session, so undo and redo work after a
-restart.
-
-## Why this works
-
-- **Works without git.** Non-git directories are fully supported.
-- **Fast on big repos.** Object reuse via git alternates, incremental adds,
-  batched restores. No full `git add` twice per turn.
-- **Garbage collection.** Daily gc keeps the snapshot store bounded. Old
-  snapshots get pruned, so storage doesn't grow forever.
-- **Cancel and failures are safe.** Cancel mid-undo rolls the files back.
-  Restores are verified by tree hash and roll back on mismatch. Manual
-  edits trigger a question first, so nothing gets clobbered.
-- **Two snapshots per message.** Each user message gets a before and an
-  after tree hash. Undo restores only the files that message changed.
-- **Gitignored files are undoable when the session edits them.** The shadow
-  repo snapshots gitignored files too, so a file the current pi session
-  touched can always be undone, even if it is in `.gitignore`. A gitignored
-  file with manual edits since the message triggers the manual-edits
-  question. Confirming restores the file and loses the manual edits.
-  Declining blocks the undo. Only pi-undo's own `excludeDirectories` are
-  never snapshotted.
-- **Undo restores only what this session wrote.** Each message records which
-  files its `write` and `edit` tools touched. Undo restores those files.
-  Files that changed during the message for another reason are listed in
-  the dialog and never restored; a warning names them. Files that another
-  pi session touched get the session id in the warning. The records live
-  in a small journal under the snapshot store, so they survive restarts.
-  Changes made by bash commands cannot be attributed and are warned about
-  the same way.
-
-## Configuration
-
-pi-undo reads one config file: `~/.pi/agent/pi-undo.json`. On the first run
-the file is created with the default values, and you edit it directly to
-change them. Add or remove patterns in `excludeDirectories`, or change
-`maxFiles`. The list in the file is the complete list: removing an entry
-really un-excludes that path.
-
-```json
-{
-  "excludeDirectories": ["node_modules", "dist", "Downloads", "tmp"],
-  "maxFiles": 100000
-}
-```
-
-| Field | What it does |
-| -------- | ------------ |
-| `excludeDirectories` | Full gitignore glob patterns, never snapshotted. Plain names match at any depth; globs like `**/build-*` or `*.tmp` work; a trailing slash means directories only |
-| `maxFiles` | Snapshot size cap (default 100000). Over this, snapshots are skipped for that message with a one-time warning instead of making pi slow |
+The design follows OpenCode: a snapshot of the files before and after each message, in a shadow git repository.
 
 ## Commands
 
-| Command | What it does                                                                                                     |
-| ------- | ---------------------------------------------------------------------------------------------------------------- |
-| `/undo` | Aborts the agent, shows a diff preview, restores the files to before the last message, and puts the prompt back. |
-| `/redo` | Re-applies the most recently undone message. Survives restarts.                                                  |
-| `/diff` | Shows what `/undo` would restore.                                                                                |
+| Command | What it does |
+| ------- | ------------ |
+| `/undo` | Stops the agent if it runs. Shows the changes of the last message. Restores the files to their state before the message. Moves the conversation back and puts the prompt in the editor. |
+| `/redo` | Applies the last undone message again: the files and the conversation. |
+| `/diff` | Shows the changes that `/undo` rolls back. It does not stop a running agent. |
+
+For example, the agent edits `src/app.ts` and creates `src/new.ts`. `/undo` restores `src/app.ts`, deletes `src/new.ts`, and removes the message from the conversation.
 
 ## Install
 
 ```bash
 pi install npm:@ahm3tj4f/pi-undo
+```
 
-# OR
+You can also install from git:
 
+```bash
 pi install git:github.com/ahm3tj4f/pi-undo
 ```
+
+pi-undo needs git 2.31 or newer.
+
+## How it works
+
+Each agent run gets two snapshots. pi-undo takes the first snapshot when the run starts. It takes the second snapshot when the run ends. A snapshot is a git tree in a shadow repository under `~/.pi/agent/pi-undo/snapshots/`. Your own git repository never changes.
+
+The two snapshots show which files the message changed. `/undo` restores all of these files. The tool that changed a file has no effect: the `edit` tool, a bash command, a formatter, and a subagent are all the same.
+
+The checkpoints are part of the pi session. Undo and redo work after a restart.
+
+## Safety
+
+- **Manual edits.** You can change a file after the message. In that case, the undo dialog shows the file and tells you that your change will be lost. Nothing changes until you confirm.
+- **Files outside the message.** `/undo` never touches a file that the message did not change.
+- **Verification.** After a restore, pi-undo compares each restored file with the snapshot.
+- **Rollback.** If a restore fails, pi-undo puts every file back to its state just before the undo. Your manual edits stay.
+- **Order.** pi-undo restores the files first and moves the conversation after. If the conversation cannot move, the files go back.
+- **Symlinks.** pi-undo never writes through a symlinked directory.
+- **Gitignored files.** pi-undo snapshots files that your `.gitignore` ignores. A change to `.env` by the agent is undoable.
+
+## Configuration
+
+pi-undo reads `~/.pi/agent/pi-undo.json`. On the first run, pi-undo writes this file with the default values. Edit the file to change them. The file is the full configuration: when you remove an entry from `excludeDirectories`, pi-undo snapshots that path again.
+
+```json
+{
+  "excludeDirectories": ["node_modules", "dist", "build", ".venv", "..."],
+  "maxFiles": 100000,
+  "retentionDays": 30
+}
+```
+
+| Field | What it does |
+| ----- | ------------ |
+| `excludeDirectories` | Gitignore patterns that pi-undo never snapshots. A plain name matches at all depths. Globs like `**/build-*` and `*.tmp` work. A trailing slash matches directories only. |
+| `maxFiles` | The largest number of new or changed files that one snapshot can add. Above this number, pi-undo skips the snapshot and shows a warning. Undo of that message can then move the conversation only. |
+| `retentionDays` | The number of days that pi-undo keeps snapshots. After this period, undo of the message can move the conversation only. |
+
+## Limits
+
+- pi-undo does not snapshot new files larger than 2 MB. It shows a warning when this occurs.
+- pi-undo does not snapshot nested git repositories. They have their own history.
+- pi-undo does not restore image attachments of a prompt to the editor.
+- Two pi sessions in the same directory share one snapshot store. If both sessions change the same file during one message, `/undo` in one session also rolls back the change of the other session.
+
+## Development
+
+```bash
+npm install
+npm run typecheck
+npm test
+```
+
+The tests use real git in temporary directories. They never touch `~/.pi`.
+
+## License
+
+MIT
