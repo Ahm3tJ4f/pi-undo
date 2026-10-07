@@ -1,6 +1,6 @@
 {
   "name": "@ahm3tj4f/pi-undo",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Undo/redo for pi, but this time it works. Per-message snapshots, ported from OpenCode's exact undo/redo philosophy.",
   "license": "MIT",
   "type": "module",
@@ -12,6 +12,10 @@
     "snapshots",
     "opencode"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ahm3tj4f/pi-undo.git"
+  },
   "publishConfig": {
     "access": "public"
   },
@@ -19,6 +23,7 @@
     "index.ts",
     "src",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "pi": {
@@ -26,19 +31,26 @@
       "./src/index.ts"
     ]
   },
+  "engines": {
+    "node": ">=22.18"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/*.test.ts"
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "test": "node --test --import ./test/setup.ts test/*.test.ts",
+    "check": "npm run typecheck && npm run lint && npm test"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
-  "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.0",
-    "@types/node": "^22.0.0",
-    "typescript": "^5.6.0"
-  },
   "dependencies": {
     "ignore": "^7.0.6"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@earendil-works/pi-coding-agent": "^1.0.4",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
   }
 }

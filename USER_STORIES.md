@@ -1,197 +1,83 @@
 # pi-undo user stories and edge cases
 
-Severity: **core** = must always work, **edge** = rare but should not break badly,
-**rare** = unlikely, nice to handle gracefully.
+Severity: **core** = must always work, **edge** = rare, must not break badly,
+**rare** = unlikely, handle it safely.
 
-## 1. Basic undo/redo
+Each story names the test that covers it, in `test/`.
 
-- US-1 (core) Last message changed a file: `/undo` restores the file to its
-  before-state, rolls the session tree back, and puts the prompt back in the
-  editor.
-- US-2 (core) No checkpoint exists (first message or nothing yet): `/undo`
-  says "Nothing to undo" and does nothing else.
-- US-3 (core) `/undo` while the agent is streaming: pi aborts the agent, waits
-  for idle, then runs the undo.
-- US-4 (core) `/redo` after an undo: re-applies the file state and moves the
-  tree forward again.
-- US-5 (core) `/redo` with an empty redo stack: says "Nothing to redo".
-- US-6 (core) `/undo` then a NEW user message: the redo stack is cleared, so
-  `/redo` says "Nothing to redo".
-- US-7 (core) Two undos in a row: each undo targets the previous message, so
-  the second undo rolls back the message before the first.
-- US-8 (core) Undo/redo survive a pi restart: checkpoints are persisted in the
-  session, so the redo stack reloads.
-- US-9 (edge) Undo the very first message in a session: the message has no
-  parent leaf, so pi-undo refuses with "Cannot undo the first message in
-  place; fork before it instead".
+## 1. Basic undo and redo
 
-## 2. File states
+- US-1 (core) The last message changed files. `/undo` restores the files to their state before the message. It moves the conversation back and puts the prompt in an empty editor. (`extension.test.ts`)
+- US-2 (core) No message has a checkpoint. `/undo` shows "Nothing to undo" and changes nothing. (`commands.test.ts`)
+- US-3 (core) The agent runs when you type `/undo`. pi-undo stops the agent, records its run, and undoes that run. (`commands.test.ts`)
+- US-4 (core) `/redo` after an undo applies the files and the conversation again. (`commands.test.ts`)
+- US-5 (core) The redo stack is empty. `/redo` shows "Nothing to redo". (`commands.test.ts`)
+- US-6 (core) A new message after an undo clears the redo stack. (`tracker.test.ts`)
+- US-7 (core) Two undos in a row undo the last two messages. (`extension.test.ts`)
+- US-8 (core) Undo and redo work after a restart. (`extension.test.ts`)
+- US-9 (core) The first message of a session can be undone. pi moves the session leaf to the root. (`extension.test.ts`)
+- US-10 (core) The editor has a draft. `/undo` keeps the draft and does not put the prompt in the editor. (`commands.test.ts`)
 
-- US-10 (core) File created during the message: undo deletes it.
-- US-11 (core) File deleted during the message: undo restores it from the
-  snapshot.
-- US-12 (core) File modified during the message: undo restores the old
-  content.
-- US-13 (edge) File replaced by a directory with the same name: undo removes
-  the directory and restores the file.
-- US-14 (edge) Directory replaced by a file with the same name: undo restores
-  the directory contents and the file.
-- US-15 (edge) Binary file changed: the diff preview shows it as binary
-  (no line stats) but restore still works.
-- US-16 (edge) Message changed no files (only tree/session work): `/undo`
-  rolls the tree back and restores the prompt without touching any files.
-- US-17 (edge) File renamed: rename shows as delete + create in the diff.
-  Undo deletes the new name and restores the old one.
-- US-18 (edge) File with tabs or unusual characters in its name: diff preview
-  and restore handle it (numstat parsing covers tabs).
-- US-19 (rare) Symlinked parent directory: restore refuses that path (it is
-  reported as skipped) so undo never writes through a symlink.
-- US-20 (rare) Chmod-only change: restore brings back the old mode.
-- US-21 (rare) FIFO/socket/special file created during a message: the size
-  check skips non-files, but `git add` could hang on a FIFO. Should be
-  investigated or blocked.
-- US-22 (rare) File larger than 2 MB, newly created: it is excluded from
-  snapshots, so undo cannot restore it. The diff preview should make this
-  visible.
+## 2. Which files undo restores
 
-## 3. Conflicts with manual edits
+- US-11 (core) `/undo` restores every file that differs between the two snapshots of the message. The tool that changed the file has no effect: the `edit` tool, bash, a formatter, and a subagent are all the same. (`extension.test.ts`, `restore.test.ts`)
+- US-12 (core) A file created by the message is deleted. Directories that become empty are removed too. (`git.test.ts`)
+- US-13 (core) A file deleted by the message comes back. (`git.test.ts`)
+- US-14 (core) A file changed by the message gets its old content back. (`git.test.ts`)
+- US-15 (edge) A file replaced by a directory with the same name, and the opposite, restore correctly. (`git.test.ts`)
+- US-16 (edge) Binary files restore correctly. The dialog marks them as binary. (`git.test.ts`)
+- US-17 (edge) A message that changed no files needs no dialog. `/undo` moves the conversation only. (`commands.test.ts`)
+- US-18 (edge) A chmod-only change restores the old mode. (`git.test.ts`)
+- US-19 (edge) A file name with a tab restores correctly. (`git.test.ts`)
+- US-20 (core) `/undo` never touches a file that the message did not change. (`restore.test.ts`)
 
-- US-23 (core) User edits a file by hand after the message, then `/undo`: if
-  that file is one the message changed, the dirty check detects it, shows the
-  "Manual edits found" dialog, and asks before restoring.
-- US-24 (core) Dialog answered "No": undo is blocked and the working tree is
-  left untouched.
-- US-25 (core) Dialog answered "Yes": undo restores and the manual edits to
-  the restored files are lost.
-- US-26 (core) Manual edits exist in files the undo will NOT touch: they are
-  never listed in the dialog and never block undo. Those edits survive the
-  undo untouched.
-- US-27 (core) Nested git repos near the worktree: they are never reported as
-  manual edits (fixed), so `/undo` in `~/` does not show false dialogs.
-- US-28 (edge) `/redo` with manual edits in files the message changed: redo is
-  blocked with a warning (no confirmation dialog, unlike undo). Manual edits
-  in other files do not block redo.
-- US-29 (edge) Dirty check passes but the user edits files between the check
-  and the restore: the post-restore verification fails and pi-undo rolls the
-  files back to the after-state.
+## 3. Manual edits
 
-## 3b. Gitignored files
+- US-21 (core) You change a file of the message after the message. The undo dialog lists the file under "These changes will be lost". (`commands.test.ts`)
+- US-22 (core) You decline the dialog. Nothing changes. (`commands.test.ts`)
+- US-23 (core) You confirm the dialog. The file gets its state before the message. (`restore.test.ts`)
+- US-24 (core) A file of the message already has its target state. pi-undo does not write it and does not list it as a manual edit. (`restore.test.ts`)
+- US-25 (core) Gitignored files follow the same rules as other files. (`restore.test.ts`)
+- US-26 (edge) Without a UI, nobody can confirm. Manual edits then stop the undo. (`commands.test.ts`)
+- US-27 (edge) `/redo` follows the same rules as `/undo`. (`commands.test.ts`)
 
-- US-57 (core) The session edits a gitignored file (`.gitignore`, local
-  excludes, global gitignore): the file is snapshotted like a normal file,
-  `/undo` and `/redo` restore it, and the diff preview shows it.
-- US-58 (core) A gitignored file has manual edits since the message: undo and
-  redo show the manual-edits prompt. Confirming restores the file and loses
-  the manual edits. Declining blocks the operation.
-- US-59 (core) The session edits a gitignored file that had manual edits
-  before the turn: `/undo` restores the pre-turn state, manual edits included.
-- US-60 (edge) A gitignored file the session edited gets manual edits after
-  the turn: `/undo` and `/redo` show the manual-edits prompt and list the
-  file. Confirming restores the pre-turn state, so the manual edits are lost.
-  Declining blocks the operation and keeps the file and its manual edits.
-- US-61 (edge) A file becomes gitignored after it was snapshotted: it stays
-  snapshotted; the session's edits to it remain undoable. Only pi-undo's own
-  `excludeDirectories` stop new snapshots of a file.
-- US-62 (edge) A file becomes excluded by `excludeDirectories` after it was
-  snapshotted: restore skips it, keeps manual edits, and drops it from the
-  index (transition window).
+## 4. Failures
 
-## 3c. Attribution of file changes
+- US-30 (core) A restore fails in the middle. pi-undo puts every file back to its state just before the undo, manual edits included. The conversation does not move. (`restore.test.ts`, `commands.test.ts`)
+- US-31 (core) A restored file does not match the snapshot. pi-undo rolls back the same way. (`restore.test.ts`)
+- US-32 (edge) The rollback fails too. The error names the files to check. (`commands.test.ts`)
+- US-33 (edge) The conversation cannot move, or you cancel the move. The files go back. (`commands.test.ts`)
+- US-34 (edge) The snapshots of the message are gone: the retention period ended, or the session moved to another directory. `/undo` tells you and offers to undo the conversation only. It never deletes files because of a missing snapshot. (`commands.test.ts`, `git.test.ts`)
+- US-35 (edge) The snapshot of a message failed or was skipped (`maxFiles`). The checkpoint records the reason. `/undo` shows it and offers to undo the conversation only. (`tracker.test.ts`, `commands.test.ts`)
+- US-36 (edge) A broken checkpoint entry in the session file is skipped. Other checkpoints still load. (`store.test.ts`)
+- US-37 (edge) Checkpoints from pi-undo 0.4 still load. (`store.test.ts`)
 
-- US-63 (core) The session writes a file with the `write` or `edit` tool: the
-  checkpoint marks the file as edited by this session. `/undo` and `/redo`
-  restore it.
-- US-64 (core) A file changes during the message, but no `write` or `edit`
-  tool touched it: the preview lists it as unattributed. The undo dialog asks
-  whether to restore it. The default is no.
-- US-65 (edge) Another pi session touched the file during the message: the
-  journal names that session. `/undo` never restores the file and shows a
-  note with the session id.
-- US-66 (edge) A bash command changes a file: the file is unattributed, so
-  the dialog asks about it.
+## 5. Runs and the session
 
-## 4. Failures and verification
+- US-40 (core) One agent run gives one checkpoint, keyed by its first user message. Steering messages and retries in the same run do not start a new checkpoint. (`tracker.test.ts`)
+- US-41 (core) A run that an extension starts with a custom message gets a checkpoint too. (`tracker.test.ts`)
+- US-42 (core) A command runs after the agent stops but before pi calls `agent_settled`. The command still sees the checkpoint of that run. (`tracker.test.ts`)
+- US-43 (edge) The `agent_settled` event of a run never arrives. The next prompt records the run first. (`extension.test.ts`)
+- US-44 (edge) You jump in the session tree with `/tree`. The redo stack clears. (`extension.test.ts`)
+- US-45 (edge) The prompt had images. `/undo` tells you that the images are not back in the editor. (`commands.test.ts`)
 
-- US-30 (core) Restore fails partway (git checkout error): pi-undo rolls the
-  files back to the after-state.
-- US-31 (core) Verification fails after restore (tree hash mismatch): files
-  are rolled back and the user is told undo failed.
-- US-32 (edge) Rollback also fails: pi-undo warns that the working tree may be
-  inconsistent.
-- US-33 (edge) Tree navigation fails after files were restored: files are
-  rolled back and the user sees the navigation error.
-- US-34 (edge) User cancels the confirmation dialog: files are rolled back and
-  undo reports cancelled.
-- US-35 (edge) Snapshot store was deleted or pruned (gc older than 7 days):
-  restore cannot find the tree, verification fails, rollback also fails, user
-  gets the inconsistent-state warning.
-- US-36 (edge) Corrupted checkpoint entry in the session file: it is skipped
-  on load and does not break other checkpoints.
-- US-37 (edge) Cap exceeded during a message (too many files): no checkpoint
-  is recorded for that message, so `/undo` reports nothing to undo.
-- US-38 (edge) Snapshot creation failed at message start (git timeout): undo
-  is disabled for that message with a warning.
+## 6. Large directories and exclusions
 
-## 5. Session lifecycle
+- US-50 (core) pi-undo never snapshots paths that match `excludeDirectories`. (`git.test.ts`)
+- US-51 (core) pi-undo never snapshots pi's own `.pi` directories. (`git.test.ts`)
+- US-52 (edge) pi-undo never snapshots nested git repositories. It shows one warning. (`git.test.ts`)
+- US-53 (edge) pi-undo never snapshots new files over 2 MB. It shows a warning. (`git.test.ts`)
+- US-54 (edge) More than `maxFiles` files to add: pi-undo skips the snapshot and shows one warning. (`git.test.ts`)
+- US-55 (edge) A path becomes excluded after the message. Undo does not restore it and tells you. (`commands.test.ts`)
+- US-56 (edge) pi runs in a subdirectory of a git repository. Only that subdirectory counts. (`git.test.ts`)
+- US-57 (edge) A symlinked directory is in the path. pi-undo never writes through it. (`git.test.ts`)
 
-- US-39 (core) Undo works after restart because checkpoints live in the
-  session file.
-- US-40 (edge) Session was compacted: old leaves may be gone. Undo of a
-  message before the compaction point may fail to navigate.
-- US-41 (edge) Session resumed in a DIFFERENT directory: the snapshot store is
-  keyed by cwd, so the old tree hashes do not exist in the new store. Restore
-  fails and rollback fails. Should detect and degrade gracefully.
-- US-42 (edge) Undo after a fork or branch switch: checkpoints are loaded from
-  the branch entries; behavior should be verified.
-- US-43 (edge) Message had image attachments: undo notes that the images are
-  not restored.
-- US-44 (rare) Undo, then redo, then undo again: the redo stack pops in order
-  (LIFO), verify the sequence stays consistent.
+## 7. Concurrency
 
-## 6. Huge folders and exclusions
-
-- US-45 (core) Undo in `~/`: no false manual-edits dialog, restore only
-  touches the message's files.
-- US-46 (core) Files under blacklisted dirs (node_modules, dist, __pycache__,
-  tool caches) are not snapshotted and not undoable. This is pi-undo's own
-  exclusion list; the project's `.gitignore` does NOT exclude files from
-  snapshots.
-- US-47 (edge) Edits inside nested git repos are not undoable (the repo has
-  its own git undo).
-- US-48 (edge) A file that was snapshotted earlier and later becomes
-  blacklisted (config change): the old snapshot still restores it; new
-  messages do not track it.
-- US-49 (edge) `maxFiles` reached: snapshots skip for that message, /undo
-  reports nothing to undo, one-time warning shown.
-
-## 7. Concurrency and races
-
-- US-50 (edge) Two pi instances open in the same directory: they share the
-  same shadow store (same cwd hash). Concurrent git writes can conflict
-  (index.lock). Should serialize or use a lock.
-- US-51 (rare) Agent creates and deletes a file within one message: the diff
-  is empty for it, undo is a no-op for that path.
-- US-52 (rare) A file changes while the snapshot is being taken: the
-  before/after trees may disagree with the final content; verification at
-  undo time catches mismatches.
-- US-53 (rare) Files created during the message but removed by hand before
-  `/undo`: restore recreates them from the snapshot (they existed at
-  after-time).
-
-## 8. Configuration
-
-- US-54 (core) `~/.pi/agent/pi-undo.json` is created with defaults
-  (`excludeDirectories` list, `maxFiles`) on first run; the user edits the
-  file to configure pi-undo.
-- US-55 (core) The `excludeDirectories` list in the file is the complete
-  list: adding a name excludes that directory, removing a name
-  un-excludes it.
-- US-56 (edge) Config changes take effect on the next snapshot;
-  already-staged files stay tracked until removed.
+- US-60 (edge) Two pi sessions in the same directory share one snapshot store. Git commands retry when the other session holds the index lock. (`git.test.ts`)
+- US-61 (edge) Calls on one store in one process run one at a time. (`git.test.ts`)
+- US-62 (edge) `GIT_DIR` and similar variables in the environment do not reach the shadow repository. (`git.test.ts`, `exec.test.ts`)
 
 ## Open questions
 
-- OQ-2 Should pi-undo guard against FIFO/special files during `git add`?
-- OQ-3 Should resuming a session in a different directory warn that old undo
-  checkpoints are unusable?
-- OQ-4 Should two concurrent pi instances share one shadow store safely?
+- OQ-1 Two sessions change the same file during one message. `/undo` in one session rolls back the change of the other session too. A warning for this case needs a reliable record of which session wrote a file.
